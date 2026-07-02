@@ -872,6 +872,7 @@ dependencies = [
  "hex",
  "hmac",
  "ipnet",
+ "libc",
  "md5",
  "rand 0.8.6",
  "reqwest",

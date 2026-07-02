@@ -14,6 +14,8 @@ use std::env;
 use std::fmt;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{Ipv4Addr, Shutdown, TcpStream, ToSocketAddrs};
+use std::os::fd::AsRawFd;
+use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread;
@@ -21,9 +23,17 @@ use std::time::{Duration, SystemTime};
 
 #[derive(Debug)]
 pub struct TcpTunnel {
-    stream: Arc<Mutex<StreamOwned<ClientConnection, TcpStream>>>,
+    incoming_rx: Mutex<mpsc::Receiver<AtrResult<Vec<u8>>>>,
+    write_tx: mpsc::Sender<TcpTunnelCommand>,
+    wake_tx: Mutex<UnixStream>,
     read_buf: Mutex<VecDeque<u8>>,
     closed: AtomicBool,
+}
+
+#[derive(Debug)]
+enum TcpTunnelCommand {
+    Write(Vec<u8>, mpsc::Sender<AtrResult<usize>>),
+    Close,
 }
 
 #[derive(Debug)]
@@ -53,16 +63,32 @@ impl TcpTunnel {
         let session = client
             .session()
             .ok_or_else(|| AtrError::InvalidState("session not set".into()))?;
-        let stream = connect_tls(&node_addr, client.client_config())?;
-        stream.sock.set_read_timeout(Some(Duration::from_millis(250)))?;
-        let tunnel = Self {
-            stream: Arc::new(Mutex::new(stream)),
+        let mut stream = connect_tls(&node_addr, client.client_config())?;
+        set_no_sigpipe(stream.sock.as_raw_fd());
+        stream.sock.set_read_timeout(Some(Duration::from_millis(
+            client.client_config().io_timeout_ms,
+        )))?;
+        send_tcp_init(&mut stream, session, &hit.app_id, host, port)?;
+        validate_tcp_tunnel_auth(&mut stream)?;
+        send_tcp_dest(&mut stream, host, port)?;
+        stream.sock.set_read_timeout(None)?;
+
+        let (incoming_tx, incoming_rx) = mpsc::channel();
+        let (write_tx, write_rx) = mpsc::channel();
+        let (wake_rx, wake_tx) = UnixStream::pair()?;
+        set_no_sigpipe(wake_rx.as_raw_fd());
+        set_no_sigpipe(wake_tx.as_raw_fd());
+        wake_rx.set_nonblocking(true)?;
+        wake_tx.set_nonblocking(true)?;
+        thread::spawn(move || run_tcp_tunnel_worker(stream, incoming_tx, write_rx, wake_rx));
+
+        Ok(Self {
+            incoming_rx: Mutex::new(incoming_rx),
+            write_tx,
+            wake_tx: Mutex::new(wake_tx),
             read_buf: Mutex::new(VecDeque::new()),
             closed: AtomicBool::new(false),
-        };
-        tunnel.send_init(session, &hit.app_id, host, port)?;
-        tunnel.send_dest(host, port)?;
-        Ok(tunnel)
+        })
     }
 
     pub fn read(&self, buf: &mut [u8]) -> AtrResult<usize> {
@@ -82,220 +108,483 @@ impl TcpTunnel {
             }
         }
 
-        let data = self.read_frame()?;
-        let mut cached = self.read_buf.lock().unwrap();
-        for b in data {
-            cached.push_back(b);
-        }
-        while copied < buf.len() {
-            if let Some(b) = cached.pop_front() {
-                buf[copied] = b;
-                copied += 1;
-            } else {
-                break;
-            }
+        let data = match self.incoming_rx.lock().unwrap().recv() {
+            Ok(result) => result?,
+            Err(_) => return Ok(0),
+        };
+        let remaining = buf.len() - copied;
+        let direct = remaining.min(data.len());
+        buf[copied..copied + direct].copy_from_slice(&data[..direct]);
+        copied += direct;
+
+        if direct < data.len() {
+            let mut cached = self.read_buf.lock().unwrap();
+            cached.extend(data[direct..].iter().copied());
         }
         Ok(copied)
     }
 
     pub fn write(&self, data: &[u8]) -> AtrResult<usize> {
-        if data.len() > u16::MAX as usize {
-            return Err(AtrError::InvalidArgument("tcp payload too large".into()));
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(AtrError::InvalidState("tcp tunnel closed".into()));
         }
-        let mut frame = Vec::with_capacity(4 + data.len());
-        frame.extend_from_slice(&[0x01, 0x00]);
-        frame.extend_from_slice(&(data.len() as u16).to_be_bytes());
-        frame.extend_from_slice(data);
-        let mut stream = self.stream.lock().unwrap();
-        stream.write_all(&frame)?;
-        stream.flush()?;
-        Ok(data.len())
+        let (ack_tx, ack_rx) = mpsc::channel();
+        self.write_tx
+            .send(TcpTunnelCommand::Write(data.to_vec(), ack_tx))
+            .map_err(|_| AtrError::NetworkFailed("tcp tunnel worker stopped".into()))?;
+        self.wake_worker();
+        ack_rx
+            .recv()
+            .map_err(|_| AtrError::NetworkFailed("tcp tunnel worker stopped".into()))?
     }
 
     pub fn close(&self) -> AtrResult<()> {
         if self.closed.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
-        let mut stream = self.stream.lock().unwrap();
-        let _ = stream.write_all(&[0x01, 0x01, 0x00, 0x00]);
-        let _ = stream.flush();
-        let _ = stream.sock.shutdown(Shutdown::Both);
+        let _ = self.write_tx.send(TcpTunnelCommand::Close);
+        self.wake_worker();
         Ok(())
     }
 
-    fn send_init(
-        &self,
-        session: &crate::types::SessionMaterial,
-        app_id: &str,
-        dest_addr: &str,
-        port: u16,
-    ) -> AtrResult<()> {
-        let proc_path = if port == 22 {
-            "/usr/bin/ssh"
-        } else {
-            "/usr/bin/libreatrust"
-        };
-        let proc_name = if port == 22 { "ssh" } else { "libreatrust" };
-        let proc_hash = format!("{:X}", sha2::Sha256::digest(proc_path.as_bytes()));
-        let msg = format!(
-            r#"{{"sid":"{}","appId":"{}","url":"tcp://{}:{}","deviceId":"{}","connectionId":"{}","procHash":"{}","userName":"{}","rcAppliedInfo":0,"lang":"en-US","destAddr":"{}:{}","env":{{"application":{{"runtime":{{"process":{{"name":"{}","digital_signature":"TrustAppClosed","platform":"Linux","fingerprint":"{}","description":"TrustAppClosed","path":"{}","version":"TrustAppClosed","security_env":"normal"}},"process_trusted":"TRUSTED"}}}}}},"xRequestSig":""}}"#,
-            session.sid,
-            app_id,
-            dest_addr,
-            port,
-            session.device_id,
-            session.connection_id,
-            proc_hash,
-            session.username,
-            dest_addr,
-            port,
-            proc_name,
-            proc_hash,
-            proc_path
-        );
-        let key = hex::decode(&session.sign_key_hex)
-            .map_err(|e| AtrError::CryptoFailed(e.to_string()))?;
-        let sig = calc_request_sig(&key, msg.as_bytes());
-        let final_msg = msg.replace(
-            r#""xRequestSig":"""#,
-            &format!(r#""xRequestSig":"{}""#, sig),
-        );
-        let mut frame = Vec::with_capacity(5 + 2 + final_msg.len());
-        frame.extend_from_slice(&[0x05, 0x01, 0x81, 0x53, 0x03]);
-        frame.extend_from_slice(&(final_msg.len() as u16).to_be_bytes());
-        frame.extend_from_slice(final_msg.as_bytes());
-        let mut stream = self.stream.lock().unwrap();
-        stream.write_all(&frame)?;
-        stream.flush()?;
-        Ok(())
-    }
-
-    fn send_dest(&self, host: &str, port: u16) -> AtrResult<()> {
-        let mut frame = Vec::new();
-        if let Ok(ip) = host.parse::<Ipv4Addr>() {
-            frame.extend_from_slice(&[0x05, 0x01, 0x01, 0x01]);
-            frame.extend_from_slice(&ip.octets());
-        } else {
-            let bytes = host.as_bytes();
-            if bytes.len() > u8::MAX as usize {
-                return Err(AtrError::InvalidArgument(format!(
-                    "domain too long: {host}"
-                )));
-            }
-            frame.extend_from_slice(&[0x05, 0x01, 0x01, 0x03, bytes.len() as u8]);
-            frame.extend_from_slice(bytes);
+    fn wake_worker(&self) {
+        if let Ok(mut wake_tx) = self.wake_tx.lock() {
+            let _ = wake_tx.write_all(&[1]);
         }
-        frame.extend_from_slice(&port.to_be_bytes());
-        let mut stream = self.stream.lock().unwrap();
-        stream.write_all(&frame)?;
-        stream.flush()?;
-        Ok(())
     }
+}
 
-    fn read_frame(&self) -> AtrResult<Vec<u8>> {
-        loop {
-            let mut header = [0u8; 2];
-            let mut stream = self.stream.lock().unwrap();
-            if !read_exact_or_empty(&mut *stream, &mut header)? {
-                return Ok(Vec::new());
+fn run_tcp_tunnel_worker(
+    mut stream: StreamOwned<ClientConnection, TcpStream>,
+    incoming_tx: mpsc::Sender<AtrResult<Vec<u8>>>,
+    write_rx: mpsc::Receiver<TcpTunnelCommand>,
+    mut wake_rx: UnixStream,
+) {
+    loop {
+        if !drain_tcp_tunnel_commands(&mut stream, &write_rx) {
+            return;
+        }
+
+        let event = match wait_for_tcp_tunnel_event(stream.sock.as_raw_fd(), wake_rx.as_raw_fd()) {
+            Ok(event) => event,
+            Err(error) => {
+                let _ = incoming_tx.send(Err(error));
+                let _ = stream.sock.shutdown(Shutdown::Both);
+                return;
             }
-            match header {
-                [0x01, 0x00] => {
-                    let mut len_bytes = [0u8; 2];
-                    if !read_exact_or_empty(&mut *stream, &mut len_bytes)? {
-                        return Ok(Vec::new());
-                    }
-                    let len = u16::from_be_bytes(len_bytes) as usize;
-                    let mut data = vec![0u8; len];
-                    if !read_exact_or_empty(&mut *stream, &mut data)? {
-                        return Ok(Vec::new());
-                    }
-                    return Ok(data);
-                }
-                [0x01, 0x01] => {
-                    let mut tail = [0u8; 2];
-                    if !read_exact_or_empty(&mut *stream, &mut tail)? {
-                        return Ok(Vec::new());
-                    }
-                    if tail == [0x30, 0x30] {
-                        return Err(AtrError::NetworkFailed(
-                            "connection closed by server".into(),
-                        ));
-                    }
-                }
-                [0x53, 0x00] => {
-                    let mut len_bytes = [0u8; 2];
-                    if !read_exact_or_empty(&mut *stream, &mut len_bytes)? {
-                        return Ok(Vec::new());
-                    }
-                    let len = u16::from_be_bytes(len_bytes) as usize;
-                    let mut payload = vec![0u8; len];
-                    if !read_exact_or_empty(&mut *stream, &mut payload)? {
-                        return Ok(Vec::new());
-                    }
-                    if !String::from_utf8_lossy(&payload).contains("OK") {
-                        return Err(AtrError::NetworkFailed(
-                            String::from_utf8_lossy(&payload).into_owned(),
-                        ));
-                    }
-                }
-                [0x05, 0x81] => {
-                    let mut marker = [0u8; 2];
-                    if !read_exact_or_empty(&mut *stream, &mut marker)? {
-                        return Ok(Vec::new());
-                    }
-                    if marker != [0x53, 0x00] {
-                        eprintln!(
-                            "[libreatrust][tcp] ignoring tunnel auth marker {:02x?}",
-                            marker
-                        );
-                        continue;
-                    }
+        };
 
-                    let mut len_bytes = [0u8; 2];
-                    if !read_exact_or_empty(&mut *stream, &mut len_bytes)? {
-                        return Ok(Vec::new());
-                    }
-                    let len = u16::from_be_bytes(len_bytes) as usize;
-                    let mut payload = vec![0u8; len];
-                    if !read_exact_or_empty(&mut *stream, &mut payload)? {
-                        return Ok(Vec::new());
-                    }
-                    let text = String::from_utf8_lossy(&payload);
-                    eprintln!("[libreatrust][tcp] tunnel auth response {}", text);
-                    if !text.contains(r#""message":"OK""#)
-                        && !text.contains(r#""message":"Succeeded""#)
-                    {
-                        return Err(AtrError::NetworkFailed(text.into_owned()));
-                    }
-                }
-                [0x05, status] => {
-                    let mut tail = [0u8; 8];
-                    if !read_exact_or_empty(&mut *stream, &mut tail)? {
-                        return Ok(Vec::new());
-                    }
-                    eprintln!(
-                        "[libreatrust][tcp] ignoring tunnel control status={:02x} tail={:02x?}",
-                        status, tail
-                    );
-                }
-                _ => {
-                    eprintln!(
-                        "[libreatrust][tcp] ignoring tunnel header {:02x} {:02x}",
-                        header[0], header[1]
-                    );
-                }
+        if event.wake_readable {
+            drain_wake_stream(&mut wake_rx);
+            if !drain_tcp_tunnel_commands(&mut stream, &write_rx) {
+                return;
+            }
+        }
+
+        if event.socket_readable {
+            if !drain_tcp_tunnel_frames(&mut stream, &incoming_tx) {
+                return;
             }
         }
     }
 }
 
-fn read_exact_or_empty<R: Read>(reader: &mut R, buf: &mut [u8]) -> AtrResult<bool> {
-    match reader.read_exact(buf) {
-        Ok(()) => Ok(true),
-        Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => Ok(false),
-        Err(err) => Err(AtrError::from(err)),
+fn drain_tcp_tunnel_frames(
+    stream: &mut StreamOwned<ClientConnection, TcpStream>,
+    incoming_tx: &mpsc::Sender<AtrResult<Vec<u8>>>,
+) -> bool {
+    // One socket readiness event may decrypt multiple aTrust frames into rustls'
+    // internal buffer. Drain the already-available frames so interactive streams
+    // do not wait for the next client keystroke to flush buffered output.
+    let _ = stream.sock.set_read_timeout(Some(Duration::from_millis(1)));
+    let result = loop {
+        match read_tcp_frame(stream) {
+            Ok(Some(data)) => {
+                if incoming_tx.send(Ok(data)).is_err() {
+                    break false;
+                }
+            }
+            Ok(None) => break true,
+            Err(error) => {
+                let _ = incoming_tx.send(Err(error));
+                break false;
+            }
+        }
+    };
+    let _ = stream.sock.set_read_timeout(None);
+    if !result {
+        let _ = stream.sock.shutdown(Shutdown::Both);
     }
+    result
+}
+
+fn drain_tcp_tunnel_commands(
+    stream: &mut StreamOwned<ClientConnection, TcpStream>,
+    write_rx: &mpsc::Receiver<TcpTunnelCommand>,
+) -> bool {
+    while let Ok(command) = write_rx.try_recv() {
+        match command {
+            TcpTunnelCommand::Write(data, ack_tx) => {
+                let result = write_tcp_payload(stream, &data);
+                let should_stop = result.is_err();
+                let _ = ack_tx.send(result);
+                if should_stop {
+                    let _ = stream.sock.shutdown(Shutdown::Both);
+                    return false;
+                }
+            }
+            TcpTunnelCommand::Close => {
+                let _ = stream.write_all(&[0x01, 0x01, 0x00, 0x00]);
+                let _ = stream.flush();
+                let _ = stream.sock.shutdown(Shutdown::Both);
+                return false;
+            }
+        }
+    }
+    true
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TcpTunnelEvent {
+    socket_readable: bool,
+    wake_readable: bool,
+}
+
+fn wait_for_tcp_tunnel_event(socket_fd: i32, wake_fd: i32) -> AtrResult<TcpTunnelEvent> {
+    let mut poll_fds = [
+        libc::pollfd {
+            fd: socket_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: wake_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+
+    loop {
+        let result = unsafe { libc::poll(poll_fds.as_mut_ptr(), poll_fds.len() as _, -1) };
+        if result > 0 {
+            return Ok(TcpTunnelEvent {
+                socket_readable: poll_fds[0].revents
+                    & (libc::POLLIN | libc::POLLHUP | libc::POLLERR)
+                    != 0,
+                wake_readable: poll_fds[1].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR)
+                    != 0,
+            });
+        }
+        if result == 0 {
+            continue;
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() == ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(AtrError::from(err));
+    }
+}
+
+fn drain_wake_stream(wake_rx: &mut UnixStream) {
+    let mut buf = [0u8; 64];
+    loop {
+        match wake_rx.read(&mut buf) {
+            Ok(0) => return,
+            Ok(_) => continue,
+            Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => {
+                return;
+            }
+            Err(_) => return,
+        }
+    }
+}
+
+fn set_no_sigpipe(fd: i32) {
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    unsafe {
+        let value: libc::c_int = 1;
+        let _ = libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_NOSIGPIPE,
+            &value as *const _ as *const libc::c_void,
+            std::mem::size_of_val(&value) as libc::socklen_t,
+        );
+    }
+}
+
+fn send_tcp_init(
+    stream: &mut StreamOwned<ClientConnection, TcpStream>,
+    session: &crate::types::SessionMaterial,
+    app_id: &str,
+    dest_addr: &str,
+    port: u16,
+) -> AtrResult<()> {
+    let proc_path = if port == 22 {
+        "/usr/bin/ssh"
+    } else {
+        "/usr/bin/libreatrust"
+    };
+    let proc_name = if port == 22 { "ssh" } else { "libreatrust" };
+    let proc_hash = format!("{:X}", sha2::Sha256::digest(proc_path.as_bytes()));
+    let msg = format!(
+        r#"{{"sid":"{}","appId":"{}","url":"tcp://{}:{}","deviceId":"{}","connectionId":"{}","procHash":"{}","userName":"{}","rcAppliedInfo":0,"lang":"en-US","destAddr":"{}:{}","env":{{"application":{{"runtime":{{"process":{{"name":"{}","digital_signature":"TrustAppClosed","platform":"Linux","fingerprint":"{}","description":"TrustAppClosed","path":"{}","version":"TrustAppClosed","security_env":"normal"}},"process_trusted":"TRUSTED"}}}}}},"xRequestSig":""}}"#,
+        session.sid,
+        app_id,
+        dest_addr,
+        port,
+        session.device_id,
+        session.connection_id,
+        proc_hash,
+        session.username,
+        dest_addr,
+        port,
+        proc_name,
+        proc_hash,
+        proc_path
+    );
+    let key =
+        hex::decode(&session.sign_key_hex).map_err(|e| AtrError::CryptoFailed(e.to_string()))?;
+    let sig = calc_request_sig(&key, msg.as_bytes());
+    let final_msg = msg.replace(
+        r#""xRequestSig":"""#,
+        &format!(r#""xRequestSig":"{}""#, sig),
+    );
+    let mut frame = Vec::with_capacity(5 + 2 + final_msg.len());
+    frame.extend_from_slice(&[0x05, 0x01, 0x81, 0x53, 0x03]);
+    frame.extend_from_slice(&(final_msg.len() as u16).to_be_bytes());
+    frame.extend_from_slice(final_msg.as_bytes());
+    stream.write_all(&frame)?;
+    stream.flush()?;
+    Ok(())
+}
+
+fn send_tcp_dest(
+    stream: &mut StreamOwned<ClientConnection, TcpStream>,
+    host: &str,
+    port: u16,
+) -> AtrResult<()> {
+    let mut frame = Vec::new();
+    if let Ok(ip) = host.parse::<Ipv4Addr>() {
+        frame.extend_from_slice(&[0x05, 0x01, 0x01, 0x01]);
+        frame.extend_from_slice(&ip.octets());
+    } else {
+        let bytes = host.as_bytes();
+        if bytes.len() > u8::MAX as usize {
+            return Err(AtrError::InvalidArgument(format!(
+                "domain too long: {host}"
+            )));
+        }
+        frame.extend_from_slice(&[0x05, 0x01, 0x01, 0x03, bytes.len() as u8]);
+        frame.extend_from_slice(bytes);
+    }
+    frame.extend_from_slice(&port.to_be_bytes());
+    stream.write_all(&frame)?;
+    stream.flush()?;
+    Ok(())
+}
+
+fn validate_tcp_tunnel_auth(
+    stream: &mut StreamOwned<ClientConnection, TcpStream>,
+) -> AtrResult<()> {
+    loop {
+        let mut header = [0u8; 2];
+        read_tunnel_exact_blocking(stream, &mut header)?;
+        match header {
+            [0x53, 0x00] => {
+                let mut len_bytes = [0u8; 2];
+                read_tunnel_exact_blocking(stream, &mut len_bytes)?;
+                let len = u16::from_be_bytes(len_bytes) as usize;
+                let mut payload = vec![0u8; len];
+                read_tunnel_exact_blocking(stream, &mut payload)?;
+                let text = String::from_utf8_lossy(&payload);
+                if text.contains("OK") || text.contains("Succeeded") {
+                    return Ok(());
+                }
+                return Err(AtrError::NetworkFailed(text.into_owned()));
+            }
+            [0x05, 0x81] => {
+                let mut marker = [0u8; 2];
+                read_tunnel_exact_blocking(stream, &mut marker)?;
+                if marker != [0x53, 0x00] {
+                    eprintln!(
+                        "[libreatrust][tcp] ignoring tunnel auth marker {:02x?}",
+                        marker
+                    );
+                    continue;
+                }
+
+                let mut len_bytes = [0u8; 2];
+                read_tunnel_exact_blocking(stream, &mut len_bytes)?;
+                let len = u16::from_be_bytes(len_bytes) as usize;
+                let mut payload = vec![0u8; len];
+                read_tunnel_exact_blocking(stream, &mut payload)?;
+                let text = String::from_utf8_lossy(&payload);
+                eprintln!("[libreatrust][tcp] tunnel auth response {}", text);
+                if text.contains(r#""message":"OK""#) || text.contains(r#""message":"Succeeded""#) {
+                    return Ok(());
+                }
+                return Err(AtrError::NetworkFailed(text.into_owned()));
+            }
+            [0x05, status] => {
+                let mut tail = [0u8; 8];
+                read_tunnel_exact_blocking(stream, &mut tail)?;
+                eprintln!(
+                    "[libreatrust][tcp] ignoring tunnel control status={:02x} tail={:02x?}",
+                    status, tail
+                );
+            }
+            [0x01, 0x00] => {
+                return Err(AtrError::NetworkFailed(
+                    "unexpected application data during tcp tunnel auth".into(),
+                ));
+            }
+            [0x01, 0x01] => {
+                let mut tail = [0u8; 2];
+                read_tunnel_exact_blocking(stream, &mut tail)?;
+                return Err(AtrError::NetworkFailed(format!(
+                    "tcp tunnel closed during auth: {:02x?}",
+                    tail
+                )));
+            }
+            _ => {
+                eprintln!(
+                    "[libreatrust][tcp] ignoring tunnel auth header {:02x} {:02x}",
+                    header[0], header[1]
+                );
+            }
+        }
+    }
+}
+
+fn write_tcp_payload(
+    stream: &mut StreamOwned<ClientConnection, TcpStream>,
+    data: &[u8],
+) -> AtrResult<usize> {
+    if data.len() > u16::MAX as usize {
+        return Err(AtrError::InvalidArgument("tcp payload too large".into()));
+    }
+    let mut frame = Vec::with_capacity(4 + data.len());
+    frame.extend_from_slice(&[0x01, 0x00]);
+    frame.extend_from_slice(&(data.len() as u16).to_be_bytes());
+    frame.extend_from_slice(data);
+    stream.write_all(&frame)?;
+    stream.flush()?;
+    Ok(data.len())
+}
+
+fn read_tcp_frame(
+    stream: &mut StreamOwned<ClientConnection, TcpStream>,
+) -> AtrResult<Option<Vec<u8>>> {
+    let mut header = [0u8; 2];
+    if !read_tunnel_exact(stream, &mut header)? {
+        return Ok(None);
+    }
+    match header {
+        [0x01, 0x00] => {
+            let mut len_bytes = [0u8; 2];
+            read_tunnel_exact_blocking(stream, &mut len_bytes)?;
+            let len = u16::from_be_bytes(len_bytes) as usize;
+            let mut data = vec![0u8; len];
+            read_tunnel_exact_blocking(stream, &mut data)?;
+            Ok(Some(data))
+        }
+        [0x01, 0x01] => {
+            let mut tail = [0u8; 2];
+            read_tunnel_exact_blocking(stream, &mut tail)?;
+            if tail == [0x30, 0x30] {
+                return Err(AtrError::NetworkFailed(
+                    "connection closed by server".into(),
+                ));
+            }
+            Ok(None)
+        }
+        [0x53, 0x00] => {
+            let mut len_bytes = [0u8; 2];
+            read_tunnel_exact_blocking(stream, &mut len_bytes)?;
+            let len = u16::from_be_bytes(len_bytes) as usize;
+            let mut payload = vec![0u8; len];
+            read_tunnel_exact_blocking(stream, &mut payload)?;
+            if !String::from_utf8_lossy(&payload).contains("OK") {
+                return Err(AtrError::NetworkFailed(
+                    String::from_utf8_lossy(&payload).into_owned(),
+                ));
+            }
+            Ok(None)
+        }
+        [0x05, 0x81] => {
+            let mut marker = [0u8; 2];
+            read_tunnel_exact_blocking(stream, &mut marker)?;
+            if marker != [0x53, 0x00] {
+                eprintln!(
+                    "[libreatrust][tcp] ignoring tunnel auth marker {:02x?}",
+                    marker
+                );
+                return Ok(None);
+            }
+
+            let mut len_bytes = [0u8; 2];
+            read_tunnel_exact_blocking(stream, &mut len_bytes)?;
+            let len = u16::from_be_bytes(len_bytes) as usize;
+            let mut payload = vec![0u8; len];
+            read_tunnel_exact_blocking(stream, &mut payload)?;
+            let text = String::from_utf8_lossy(&payload);
+            eprintln!("[libreatrust][tcp] tunnel auth response {}", text);
+            if !text.contains(r#""message":"OK""#) && !text.contains(r#""message":"Succeeded""#) {
+                return Err(AtrError::NetworkFailed(text.into_owned()));
+            }
+            Ok(None)
+        }
+        [0x05, status] => {
+            let mut tail = [0u8; 8];
+            read_tunnel_exact_blocking(stream, &mut tail)?;
+            eprintln!(
+                "[libreatrust][tcp] ignoring tunnel control status={:02x} tail={:02x?}",
+                status, tail
+            );
+            Ok(None)
+        }
+        _ => {
+            eprintln!(
+                "[libreatrust][tcp] ignoring tunnel header {:02x} {:02x}",
+                header[0], header[1]
+            );
+            Ok(None)
+        }
+    }
+}
+
+fn read_tunnel_exact<R: Read>(reader: &mut R, buf: &mut [u8]) -> AtrResult<bool> {
+    let mut offset = 0usize;
+    while offset < buf.len() {
+        match reader.read(&mut buf[offset..]) {
+            Ok(0) => {
+                return if offset == 0 {
+                    Err(AtrError::NetworkFailed(
+                        "connection closed by server".into(),
+                    ))
+                } else {
+                    Err(AtrError::NetworkFailed(
+                        "unexpected eof in tcp tunnel frame".into(),
+                    ))
+                };
+            }
+            Ok(n) => offset += n,
+            Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                if offset == 0 {
+                    return Ok(false);
+                }
+            }
+            Err(err) => return Err(AtrError::from(err)),
+        }
+    }
+    Ok(true)
+}
+
+fn read_tunnel_exact_blocking<R: Read>(reader: &mut R, buf: &mut [u8]) -> AtrResult<()> {
+    while !read_tunnel_exact(reader, buf)? {}
+    Ok(())
 }
 
 impl UdpTunnel {
