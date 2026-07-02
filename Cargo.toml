@@ -7,6 +7,12 @@ build = "build.rs"
 [lib]
 crate-type = ["cdylib", "staticlib"]
 
+[profile.release]
+lto = "thin"
+strip = "symbols"
+codegen-units = 1
+panic = "abort"
+
 [dependencies]
 base64 = "0.22"
 hex = "0.4"
