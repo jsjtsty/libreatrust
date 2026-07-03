@@ -2,16 +2,20 @@ mod auth;
 mod client;
 mod error;
 mod ffi;
+mod proxy_service;
 mod resource;
 mod sign;
 mod transport;
+mod tun_proxy;
 mod types;
 
 pub use auth::AuthSession;
 pub use client::AtrClient;
 pub use error::{AtrError, AtrResult, ErrorCode};
+pub use proxy_service::{ProxyService, ProxyServiceConfig, ProxyServiceStats, ProxyServiceStatus};
 pub use resource::{DomainResource, IpResource, ResourceSnapshot};
 pub use transport::{L3Tunnel, TcpTunnel, UdpTunnel};
+pub use tun_proxy::{TunDnsStrategy, TunLogLevel, TunProxyConfig, TunProxyEngine, TunProxyStatus};
 pub use types::{
     AuthChallenge, AuthChallengeKind, AuthConfig, AuthMethodInfo, CallbackTarget, ClientConfig,
     PasswordLoginInput, ProtocolKind, RouteDecision, RouteHit, SessionMaterial, SmsLoginInput,

@@ -14,6 +14,8 @@ typedef struct atr_auth_session_t atr_auth_session_t;
 typedef struct atr_tcp_tunnel_t atr_tcp_tunnel_t;
 typedef struct atr_udp_tunnel_t atr_udp_tunnel_t;
 typedef struct atr_l3_tunnel_t atr_l3_tunnel_t;
+typedef struct atr_proxy_service_t atr_proxy_service_t;
+typedef struct atr_tun_proxy_engine_t atr_tun_proxy_engine_t;
 
 typedef enum atr_error_code {
     ATR_OK = 0,
@@ -38,6 +40,11 @@ typedef struct atr_string_list_t {
     char **items;
     size_t len;
 } atr_string_list_t;
+
+typedef struct atr_string_list_input_t {
+    const char **items;
+    size_t len;
+} atr_string_list_input_t;
 
 typedef struct atr_cookie_input_t {
     const char *host;
@@ -197,6 +204,77 @@ typedef enum atr_auth_challenge_kind_t {
     ATR_AUTH_CHALLENGE_DONE = 3
 } atr_auth_challenge_kind_t;
 
+typedef enum atr_tun_dns_strategy_t {
+    ATR_TUN_DNS_VIRTUAL = 0,
+    ATR_TUN_DNS_OVER_TCP = 1,
+    ATR_TUN_DNS_DIRECT = 2
+} atr_tun_dns_strategy_t;
+
+typedef enum atr_tun_log_level_t {
+    ATR_TUN_LOG_OFF = 0,
+    ATR_TUN_LOG_ERROR = 1,
+    ATR_TUN_LOG_WARN = 2,
+    ATR_TUN_LOG_INFO = 3,
+    ATR_TUN_LOG_DEBUG = 4,
+    ATR_TUN_LOG_TRACE = 5
+} atr_tun_log_level_t;
+
+typedef enum atr_tun_proxy_status_t {
+    ATR_TUN_PROXY_RUNNING = 0,
+    ATR_TUN_PROXY_STOPPED = 1
+} atr_tun_proxy_status_t;
+
+typedef enum atr_proxy_service_status_t {
+    ATR_PROXY_SERVICE_RUNNING = 0,
+    ATR_PROXY_SERVICE_STOPPED = 1
+} atr_proxy_service_status_t;
+
+typedef enum atr_proxy_service_event_kind_t {
+    ATR_PROXY_SERVICE_EVENT_NONE = 0,
+    ATR_PROXY_SERVICE_EVENT_ERROR = 1,
+    ATR_PROXY_SERVICE_EVENT_SESSION_INVALIDATED = 2
+} atr_proxy_service_event_kind_t;
+
+typedef struct atr_proxy_service_config_t {
+    const char *listen_host;
+    uint16_t listen_port;
+    uint64_t connect_timeout_ms;
+    uint64_t idle_timeout_ms;
+    bool enable_http;
+    bool enable_socks5;
+} atr_proxy_service_config_t;
+
+typedef struct atr_proxy_service_endpoint_t {
+    char *host;
+    uint16_t port;
+} atr_proxy_service_endpoint_t;
+
+typedef struct atr_proxy_service_stats_t {
+    uint64_t active_connections;
+    uint64_t total_connections;
+    char *last_error;
+    atr_proxy_service_event_kind_t last_event_kind;
+    char *last_event_message;
+} atr_proxy_service_stats_t;
+
+typedef struct atr_tun_proxy_config_t {
+    const char *proxy_url;
+    const char *tun_name;
+    atr_tun_dns_strategy_t dns_strategy;
+    const char *dns_addr;
+    const char *virtual_dns_pool;
+    atr_string_list_input_t bypass_cidrs;
+    uint16_t mtu;
+    uint64_t tcp_timeout_secs;
+    uint64_t udp_timeout_secs;
+    size_t max_sessions;
+    bool setup_routes;
+    bool ipv6_enabled;
+    bool packet_information;
+    bool exit_on_fatal_error;
+    atr_tun_log_level_t verbosity;
+} atr_tun_proxy_config_t;
+
 typedef struct atr_auth_challenge_t {
     atr_auth_challenge_kind_t kind;
     atr_blob_t image;
@@ -246,6 +324,22 @@ int atr_l3_tunnel_read_packet(const atr_l3_tunnel_t *tunnel, uint8_t *buf, size_
 int atr_l3_tunnel_write_packet(const atr_l3_tunnel_t *tunnel, const uint8_t *buf, size_t len, size_t *out_len);
 int atr_l3_tunnel_get_virtual_ips(const atr_l3_tunnel_t *tunnel, atr_string_list_t *out);
 
+int atr_client_start_proxy_service(const atr_client_t *client, const atr_proxy_service_config_t *config, atr_proxy_service_t **out);
+int atr_proxy_service_stop(const atr_proxy_service_t *service);
+int atr_proxy_service_status(const atr_proxy_service_t *service, atr_proxy_service_status_t *out);
+int atr_proxy_service_get_endpoint(const atr_proxy_service_t *service, atr_proxy_service_endpoint_t *out);
+int atr_proxy_service_get_stats(const atr_proxy_service_t *service, atr_proxy_service_stats_t *out);
+int atr_proxy_service_take_event(const atr_proxy_service_t *service, atr_proxy_service_event_kind_t *out_kind, char **out_message);
+void atr_proxy_service_endpoint_free(atr_proxy_service_endpoint_t *endpoint);
+void atr_proxy_service_stats_free(atr_proxy_service_stats_t *stats);
+void atr_proxy_service_free(atr_proxy_service_t *service);
+
+int atr_tun_proxy_engine_start(const atr_tun_proxy_config_t *config, atr_tun_proxy_engine_t **out);
+int atr_tun_proxy_engine_stop(const atr_tun_proxy_engine_t *engine);
+int atr_tun_proxy_engine_status(const atr_tun_proxy_engine_t *engine, atr_tun_proxy_status_t *out);
+int atr_tun_proxy_engine_take_result(const atr_tun_proxy_engine_t *engine, size_t *out_sessions);
+void atr_tun_proxy_engine_free(atr_tun_proxy_engine_t *engine);
+
 int atr_auth_session_new(const atr_auth_config_t *config, atr_auth_session_t **out);
 void atr_auth_session_free(atr_auth_session_t *session);
 int atr_auth_session_available_methods(atr_auth_session_t *session, atr_auth_method_list_t *out);
@@ -260,6 +354,7 @@ int atr_auth_session_complete_callback_with_device(atr_auth_session_t *session, 
 int atr_auth_session_fetch_client_resource(atr_auth_session_t *session, atr_blob_t *out);
 int atr_auth_session_get_client_resource(atr_auth_session_t *session, atr_blob_t *out);
 int atr_auth_session_import_session(atr_auth_session_t *session, const atr_session_material_input_t *session_material);
+int atr_auth_session_resume_session(atr_auth_session_t *session, const atr_session_material_input_t *session_material, atr_session_material_t *out);
 int atr_auth_session_export_session(const atr_auth_session_t *session, atr_session_material_t *out);
 
 #ifdef __cplusplus

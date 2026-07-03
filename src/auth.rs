@@ -35,6 +35,7 @@ enum PendingFlow {
 pub struct AuthSession {
     config: AuthConfig,
     client: Client,
+    cookie_jar: Arc<Jar>,
     base_url: Url,
     base_host: String,
     csrf_token: String,
@@ -155,7 +156,7 @@ impl AuthSession {
         let base_url = Url::parse(&format!("https://{}", base_host))?;
         let jar = Arc::new(Jar::default());
         let client = Client::builder()
-            .cookie_provider(jar)
+            .cookie_provider(jar.clone())
             .redirect(reqwest::redirect::Policy::none())
             .danger_accept_invalid_certs(config.allow_insecure_tls)
             .timeout(Duration::from_millis(config.io_timeout_ms.max(1)))
@@ -164,6 +165,7 @@ impl AuthSession {
         Ok(Self {
             config,
             client,
+            cookie_jar: jar,
             base_url,
             base_host,
             csrf_token: String::new(),
@@ -294,9 +296,24 @@ impl AuthSession {
         self.sid = session.sid;
         self.cookies.clear();
         for cookie in session.cookies {
+            self.install_cookie(&cookie);
             self.cookies.insert(cookie.name.clone(), cookie);
         }
         self.env = self.build_env(&self.device_id);
+    }
+
+    pub fn resume_session(&mut self, session: SessionMaterial) -> AtrResult<SessionMaterial> {
+        self.import_session(session);
+        let (is_login, _) = self.auth_config_init()?;
+        if !is_login {
+            return Err(AtrError::Unauthorized(
+                "stored session is not logged in".into(),
+            ));
+        }
+        let username = self.online_info()?;
+        self.username = username;
+        self.sync_sid_from_cookies();
+        Ok(self.session_material())
     }
 
     pub fn session_material(&self) -> SessionMaterial {
@@ -430,7 +447,12 @@ impl AuthSession {
 
     fn fetch_client_resource(&mut self) -> AtrResult<Vec<u8>> {
         if self.ticket.is_empty() {
-            return Err(AtrError::InvalidState("ticket is empty".into()));
+            let (is_login, _) = self.auth_config_init()?;
+            if !is_login {
+                return Err(AtrError::Unauthorized(
+                    "stored session is not logged in".into(),
+                ));
+            }
         }
         let mut url = self.base_url.join("/controller/v1/user/clientResource")?;
         {
@@ -819,10 +841,29 @@ impl AuthSession {
     fn capture_cookies(&mut self, response: &Response) -> AtrResult<()> {
         for value in response.headers().get_all(SET_COOKIE).iter() {
             if let Ok(cookie) = parse_set_cookie(value, &self.base_host) {
+                self.install_cookie(&cookie);
                 self.cookies.insert(cookie.name.clone(), cookie);
             }
         }
         Ok(())
+    }
+
+    fn install_cookie(&self, cookie: &CookieRecord) {
+        let host = if cookie.host.is_empty() {
+            &self.base_host
+        } else {
+            &cookie.host
+        };
+        let scheme = if cookie.scheme.is_empty() {
+            "https"
+        } else {
+            &cookie.scheme
+        };
+        let Ok(url) = Url::parse(&format!("{scheme}://{host}")) else {
+            return;
+        };
+        self.cookie_jar
+            .add_cookie_str(&format!("{}={}", cookie.name, cookie.value), &url);
     }
 
     fn collect_cookies(&self) -> Vec<CookieRecord> {
