@@ -3,12 +3,9 @@
 use crate::auth::AuthSession;
 use crate::client::AtrClient;
 use crate::error::{AtrError, AtrResult, ErrorCode};
-use crate::proxy_service::{
-    ProxyService, ProxyServiceConfig, ProxyServiceEvent, ProxyServiceStatus,
-};
+use crate::proxy_service::{ProxyService, ProxyServiceConfig, ProxyServiceEvent, ProxyServiceStatus};
 use crate::resource::{DomainResource, IpResource, ResourceSnapshot, parse_resource_bytes};
 use crate::transport::{L3Tunnel, TcpTunnel, UdpTunnel};
-use crate::tun_proxy::{TunDnsStrategy, TunLogLevel, TunProxyConfig, TunProxyEngine, TunProxyStatus};
 use crate::types::{
     AuthChallenge, AuthChallengeKind, AuthConfig, CallbackTarget, ClientConfig, CookieRecord,
     PasswordLoginInput, SessionMaterial, SmsLoginInput,
@@ -49,21 +46,9 @@ pub struct atr_proxy_service_t {
 }
 
 #[repr(C)]
-pub struct atr_tun_proxy_engine_t {
-    inner: TunProxyEngine,
-}
-
-#[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct atr_string_list_t {
     pub items: *mut *mut c_char,
-    pub len: usize,
-}
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct atr_string_list_input_t {
-    pub items: *const *const c_char,
     pub len: usize,
 }
 
@@ -279,34 +264,6 @@ pub enum atr_auth_challenge_kind_t {
 }
 
 #[repr(C)]
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum atr_tun_dns_strategy_t {
-    ATR_TUN_DNS_VIRTUAL = 0,
-    ATR_TUN_DNS_OVER_TCP = 1,
-    ATR_TUN_DNS_DIRECT = 2,
-}
-
-#[repr(C)]
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum atr_tun_log_level_t {
-    ATR_TUN_LOG_OFF = 0,
-    ATR_TUN_LOG_ERROR = 1,
-    ATR_TUN_LOG_WARN = 2,
-    ATR_TUN_LOG_INFO = 3,
-    ATR_TUN_LOG_DEBUG = 4,
-    ATR_TUN_LOG_TRACE = 5,
-}
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum atr_tun_proxy_status_t {
-    ATR_TUN_PROXY_RUNNING = 0,
-    ATR_TUN_PROXY_STOPPED = 1,
-}
-
-#[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum atr_proxy_service_status_t {
     ATR_PROXY_SERVICE_RUNNING = 0,
@@ -314,8 +271,7 @@ pub enum atr_proxy_service_status_t {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
-#[allow(non_camel_case_types)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum atr_proxy_service_event_kind_t {
     ATR_PROXY_SERVICE_EVENT_NONE = 0,
     ATR_PROXY_SERVICE_EVENT_ERROR = 1,
@@ -352,26 +308,6 @@ pub struct atr_proxy_service_stats_t {
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
-pub struct atr_tun_proxy_config_t {
-    pub proxy_url: *const c_char,
-    pub tun_name: *const c_char,
-    pub dns_strategy: atr_tun_dns_strategy_t,
-    pub dns_addr: *const c_char,
-    pub virtual_dns_pool: *const c_char,
-    pub bypass_cidrs: atr_string_list_input_t,
-    pub mtu: u16,
-    pub tcp_timeout_secs: u64,
-    pub udp_timeout_secs: u64,
-    pub max_sessions: usize,
-    pub setup_routes: bool,
-    pub ipv6_enabled: bool,
-    pub packet_information: bool,
-    pub exit_on_fatal_error: bool,
-    pub verbosity: atr_tun_log_level_t,
-}
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
 pub struct atr_auth_challenge_t {
     pub kind: atr_auth_challenge_kind_t,
     pub image: atr_blob_t,
@@ -399,34 +335,6 @@ fn cstr_to_string(ptr: *const c_char, field: &'static str) -> Result<String, Atr
         .to_str()
         .map(|s| s.to_string())
         .map_err(|e| AtrError::ParseFailed(e.to_string()))
-}
-
-fn optional_cstr_to_string(ptr: *const c_char) -> Result<Option<String>, AtrError> {
-    if ptr.is_null() {
-        return Ok(None);
-    }
-    let value = unsafe { CStr::from_ptr(ptr) }
-        .to_str()
-        .map_err(|e| AtrError::ParseFailed(e.to_string()))?;
-    if value.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(value.to_string()))
-    }
-}
-
-fn string_list_input_from_ffi(input: atr_string_list_input_t) -> Result<Vec<String>, AtrError> {
-    if input.items.is_null() {
-        if input.len == 0 {
-            return Ok(Vec::new());
-        }
-        return Err(AtrError::InvalidArgument("string list items is null".into()));
-    }
-    let items = unsafe { std::slice::from_raw_parts(input.items, input.len) };
-    items
-        .iter()
-        .map(|item| cstr_to_string(*item, "string_list.item"))
-        .collect()
 }
 
 fn set_string_out(out: *mut *mut c_char, value: String) -> Result<(), AtrError> {
@@ -998,60 +906,6 @@ fn session_material_from_ffi(input: &atr_session_material_input_t) -> AtrResult<
         sign_key_hex: cstr_to_string(input.sign_key_hex, "sign_key_hex")?,
         cookies,
     })
-}
-
-fn tun_proxy_config_from_ffi(input: &atr_tun_proxy_config_t) -> AtrResult<TunProxyConfig> {
-    let mut config = TunProxyConfig::default();
-    config.proxy_url = cstr_to_string(input.proxy_url, "proxy_url")?;
-    config.tun_name = optional_cstr_to_string(input.tun_name)?;
-    config.dns_strategy = match input.dns_strategy {
-        atr_tun_dns_strategy_t::ATR_TUN_DNS_VIRTUAL => TunDnsStrategy::Virtual,
-        atr_tun_dns_strategy_t::ATR_TUN_DNS_OVER_TCP => TunDnsStrategy::OverTcp,
-        atr_tun_dns_strategy_t::ATR_TUN_DNS_DIRECT => TunDnsStrategy::Direct,
-    };
-    if let Some(dns_addr) = optional_cstr_to_string(input.dns_addr)? {
-        config.dns_addr = dns_addr;
-    }
-    if let Some(pool) = optional_cstr_to_string(input.virtual_dns_pool)? {
-        config.virtual_dns_pool = pool;
-    }
-    config.bypass_cidrs = string_list_input_from_ffi(input.bypass_cidrs)?;
-    config.mtu = if input.mtu == 0 { config.mtu } else { input.mtu };
-    config.tcp_timeout_secs = if input.tcp_timeout_secs == 0 {
-        config.tcp_timeout_secs
-    } else {
-        input.tcp_timeout_secs
-    };
-    config.udp_timeout_secs = if input.udp_timeout_secs == 0 {
-        config.udp_timeout_secs
-    } else {
-        input.udp_timeout_secs
-    };
-    config.max_sessions = if input.max_sessions == 0 {
-        config.max_sessions
-    } else {
-        input.max_sessions
-    };
-    config.setup_routes = input.setup_routes;
-    config.ipv6_enabled = input.ipv6_enabled;
-    config.packet_information = input.packet_information;
-    config.exit_on_fatal_error = input.exit_on_fatal_error;
-    config.verbosity = match input.verbosity {
-        atr_tun_log_level_t::ATR_TUN_LOG_OFF => TunLogLevel::Off,
-        atr_tun_log_level_t::ATR_TUN_LOG_ERROR => TunLogLevel::Error,
-        atr_tun_log_level_t::ATR_TUN_LOG_WARN => TunLogLevel::Warn,
-        atr_tun_log_level_t::ATR_TUN_LOG_INFO => TunLogLevel::Info,
-        atr_tun_log_level_t::ATR_TUN_LOG_DEBUG => TunLogLevel::Debug,
-        atr_tun_log_level_t::ATR_TUN_LOG_TRACE => TunLogLevel::Trace,
-    };
-    Ok(config)
-}
-
-fn tun_proxy_status_to_ffi(status: TunProxyStatus) -> atr_tun_proxy_status_t {
-    match status {
-        TunProxyStatus::Running => atr_tun_proxy_status_t::ATR_TUN_PROXY_RUNNING,
-        TunProxyStatus::Stopped => atr_tun_proxy_status_t::ATR_TUN_PROXY_STOPPED,
-    }
 }
 
 fn proxy_service_config_from_ffi(input: &atr_proxy_service_config_t) -> AtrResult<ProxyServiceConfig> {
@@ -2174,80 +2028,6 @@ pub extern "C" fn atr_proxy_service_free(service: *mut atr_proxy_service_t) {
     if !service.is_null() {
         unsafe {
             drop(Box::from_raw(service));
-        }
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn atr_tun_proxy_engine_start(
-    config: *const atr_tun_proxy_config_t,
-    out: *mut *mut atr_tun_proxy_engine_t,
-) -> i32 {
-    if config.is_null() || out.is_null() {
-        return ErrorCode::InvalidArgument as i32;
-    }
-    let result = (|| -> Result<(), AtrError> {
-        let config = tun_proxy_config_from_ffi(unsafe { &*config })?;
-        let engine = TunProxyEngine::start(config)?;
-        unsafe {
-            *out = Box::into_raw(Box::new(atr_tun_proxy_engine_t { inner: engine }));
-        }
-        Ok(())
-    })();
-    match result {
-        Ok(()) => ErrorCode::Ok as i32,
-        Err(err) => store_error(&err) as i32,
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn atr_tun_proxy_engine_stop(engine: *const atr_tun_proxy_engine_t) -> i32 {
-    if engine.is_null() {
-        return ErrorCode::InvalidArgument as i32;
-    }
-    match unsafe { &*engine }.inner.stop() {
-        Ok(()) => ErrorCode::Ok as i32,
-        Err(err) => store_error(&err) as i32,
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn atr_tun_proxy_engine_status(
-    engine: *const atr_tun_proxy_engine_t,
-    out: *mut atr_tun_proxy_status_t,
-) -> i32 {
-    if engine.is_null() || out.is_null() {
-        return ErrorCode::InvalidArgument as i32;
-    }
-    unsafe {
-        *out = tun_proxy_status_to_ffi((&*engine).inner.status());
-    }
-    ErrorCode::Ok as i32
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn atr_tun_proxy_engine_take_result(
-    engine: *const atr_tun_proxy_engine_t,
-    out_sessions: *mut usize,
-) -> i32 {
-    if engine.is_null() || out_sessions.is_null() {
-        return ErrorCode::InvalidArgument as i32;
-    }
-    match unsafe { &*engine }.inner.take_result() {
-        None => ErrorCode::InvalidState as i32,
-        Some(Ok(sessions)) => {
-            unsafe { *out_sessions = sessions };
-            ErrorCode::Ok as i32
-        }
-        Some(Err(err)) => store_error(&err) as i32,
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn atr_tun_proxy_engine_free(engine: *mut atr_tun_proxy_engine_t) {
-    if !engine.is_null() {
-        unsafe {
-            drop(Box::from_raw(engine));
         }
     }
 }
