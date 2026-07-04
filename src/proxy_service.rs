@@ -1,6 +1,6 @@
 use crate::client::AtrClient;
 use crate::error::{AtrError, AtrResult};
-use crate::transport::TcpTunnel;
+use crate::transport::{TcpTunnel, connect_tcp_bound};
 use crate::types::RouteDecision;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
@@ -379,7 +379,7 @@ fn open_proxy_target(
             crate::diag_log(format!(
                 "[libreatrust][proxy] route direct requested={host}:{port} connect={addr}"
             ));
-            let stream = TcpStream::connect_timeout(
+            let stream = connect_tcp_bound(
                 &addr,
                 Duration::from_millis(config.connect_timeout_ms.max(1)),
             )?;

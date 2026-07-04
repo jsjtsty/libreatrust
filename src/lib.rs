@@ -11,21 +11,6 @@ mod types;
 pub(crate) fn diag_log(message: impl AsRef<str>) {
     let message = message.as_ref();
     eprintln!("{message}");
-
-    let Ok(home) = std::env::var("HOME") else {
-        return;
-    };
-    let log_dir = std::path::Path::new(&home).join("Library/Logs/NulConnect");
-    let _ = std::fs::create_dir_all(&log_dir);
-
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_dir.join("app.log"))
-    {
-        use std::io::Write;
-        let _ = writeln!(file, "{message}");
-    }
 }
 
 pub use auth::AuthSession;

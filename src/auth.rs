@@ -289,8 +289,8 @@ impl AuthSession {
 
     pub fn import_session(&mut self, session: SessionMaterial) {
         self.device_id = session.device_id;
-        self.connection_id = session.connection_id;
-        self.sign_key_hex = session.sign_key_hex;
+        self.connection_id = self.build_connection_id(&self.device_id);
+        self.sign_key_hex = random_hex(64);
         self.username = session.username;
         self.ticket.clear();
         self.sid = session.sid;
@@ -339,6 +339,7 @@ impl AuthSession {
     fn reset_identity(&mut self, device_id: String) {
         self.device_id = device_id;
         self.connection_id = self.build_connection_id(&self.device_id);
+        self.sign_key_hex = random_hex(64);
         self.env = self.build_env(&self.device_id);
         self.ticket.clear();
         self.sid.clear();
@@ -932,7 +933,8 @@ impl AuthSession {
     }
 
     fn build_env(&self, device_id: &str) -> String {
-        json!({ "deviceId": device_id }).to_string()
+        let payload = json!({ "deviceId": device_id }).to_string();
+        base64::engine::general_purpose::STANDARD.encode(payload.as_bytes())
     }
 
     fn build_connection_id(&self, device_id: &str) -> String {

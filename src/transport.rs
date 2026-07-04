@@ -11,13 +11,14 @@ use serde_json::json;
 use sha2::Digest;
 use std::collections::{HashMap, VecDeque};
 use std::env;
+use std::ffi::CStr;
 use std::fmt;
 use std::io::{ErrorKind, Read, Write};
-use std::net::{Ipv4Addr, Shutdown, TcpStream, ToSocketAddrs};
-use std::os::fd::AsRawFd;
+use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, mpsc};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, SystemTime};
 
@@ -318,6 +319,324 @@ fn set_no_sigpipe(fd: i32) {
             &value as *const _ as *const libc::c_void,
             std::mem::size_of_val(&value) as libc::socklen_t,
         );
+    }
+}
+
+pub(crate) fn connect_tcp_bound(addr: &SocketAddr, timeout: Duration) -> AtrResult<TcpStream> {
+    let fd = unsafe { libc::socket(socket_domain(addr), libc::SOCK_STREAM, 0) };
+    if fd < 0 {
+        return Err(AtrError::from(std::io::Error::last_os_error()));
+    }
+
+    if let Err(err) = set_bound_interface(fd, addr) {
+        unsafe {
+            libc::close(fd);
+        }
+        return Err(err);
+    }
+    set_no_sigpipe(fd);
+    if let Err(err) = set_nonblocking(fd, true) {
+        unsafe {
+            libc::close(fd);
+        }
+        return Err(err);
+    }
+
+    let (storage, len) = sockaddr_storage(addr);
+    let connect_result = unsafe {
+        libc::connect(
+            fd,
+            &storage as *const _ as *const libc::sockaddr,
+            len as libc::socklen_t,
+        )
+    };
+    if connect_result != 0 {
+        let err = std::io::Error::last_os_error();
+        if err.kind() != ErrorKind::WouldBlock
+            && err.raw_os_error() != Some(libc::EINPROGRESS)
+            && err.raw_os_error() != Some(libc::EALREADY)
+        {
+            unsafe {
+                libc::close(fd);
+            }
+            return Err(AtrError::from(err));
+        }
+    }
+
+    if let Err(err) = wait_for_connect(fd, timeout) {
+        unsafe {
+            libc::close(fd);
+        }
+        return Err(err);
+    }
+
+    if let Err(err) = set_nonblocking(fd, false) {
+        unsafe {
+            libc::close(fd);
+        }
+        return Err(err);
+    }
+    let stream = unsafe { TcpStream::from_raw_fd(fd) };
+    Ok(stream)
+}
+
+fn socket_domain(addr: &SocketAddr) -> libc::c_int {
+    match addr {
+        SocketAddr::V4(_) => libc::AF_INET,
+        SocketAddr::V6(_) => libc::AF_INET6,
+    }
+}
+
+static PHYSICAL_INTERFACE_INDEX: OnceLock<u32> = OnceLock::new();
+
+fn set_bound_interface(fd: libc::c_int, addr: &SocketAddr) -> AtrResult<()> {
+    let Some(interface_index) = default_physical_interface_index(addr) else {
+        crate::diag_log(
+            "[libreatrust][transport] no physical interface available for bound socket",
+        );
+        return Ok(());
+    };
+    let value = interface_index as libc::c_int;
+    let (level, option) = match addr {
+        SocketAddr::V4(_) => (libc::IPPROTO_IP, 25),
+        SocketAddr::V6(_) => (libc::IPPROTO_IPV6, 125),
+    };
+    let result = unsafe {
+        libc::setsockopt(
+            fd,
+            level,
+            option,
+            &value as *const _ as *const libc::c_void,
+            std::mem::size_of_val(&value) as libc::socklen_t,
+        )
+    };
+    if result != 0 {
+        return Err(AtrError::from(std::io::Error::last_os_error()));
+    }
+    crate::diag_log(format!(
+        "[libreatrust][transport] bound outbound socket to if_index={interface_index}"
+    ));
+    Ok(())
+}
+
+fn default_physical_interface_index(addr: &SocketAddr) -> Option<u32> {
+    if let Some(index) = PHYSICAL_INTERFACE_INDEX.get().copied() {
+        return Some(index);
+    }
+    let index = route_default_physical_interface(addr).or_else(|| active_physical_interface(addr));
+    if let Some(index) = index {
+        let _ = PHYSICAL_INTERFACE_INDEX.set(index);
+    }
+    index
+}
+
+fn route_default_physical_interface(addr: &SocketAddr) -> Option<u32> {
+    let family_flag = match addr {
+        SocketAddr::V4(_) => "-inet",
+        SocketAddr::V6(_) => "-inet6",
+    };
+    let output = std::process::Command::new("/sbin/route")
+        .args(["-n", "get", family_flag, "default"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let interface = route_field(&text, "interface")?;
+    if !is_physical_interface_name(&interface) {
+        return None;
+    }
+    let c_name = std::ffi::CString::new(interface).ok()?;
+    let index = unsafe { libc::if_nametoindex(c_name.as_ptr()) };
+    if index == 0 { None } else { Some(index) }
+}
+
+fn active_physical_interface(addr: &SocketAddr) -> Option<u32> {
+    let family = match addr {
+        SocketAddr::V4(_) => libc::AF_INET,
+        SocketAddr::V6(_) => libc::AF_INET6,
+    };
+    let mut ifaddrs: *mut libc::ifaddrs = std::ptr::null_mut();
+    if unsafe { libc::getifaddrs(&mut ifaddrs) } != 0 {
+        return None;
+    }
+
+    let mut best: Option<(i32, u32, String)> = None;
+    let mut current = ifaddrs;
+    while !current.is_null() {
+        let ifaddr = unsafe { &*current };
+        if !ifaddr.ifa_addr.is_null() {
+            let sockaddr = unsafe { &*ifaddr.ifa_addr };
+            if sockaddr.sa_family as libc::c_int == family
+                && interface_flags_are_usable(ifaddr.ifa_flags)
+            {
+                let name = unsafe { CStr::from_ptr(ifaddr.ifa_name) }
+                    .to_string_lossy()
+                    .into_owned();
+                if is_physical_interface_name(&name) {
+                    if let Ok(c_name) = std::ffi::CString::new(name.as_str()) {
+                        let index = unsafe { libc::if_nametoindex(c_name.as_ptr()) };
+                        if index != 0 {
+                            let score = physical_interface_score(&name);
+                            if best
+                                .as_ref()
+                                .map_or(true, |(best_score, _, _)| score > *best_score)
+                            {
+                                best = Some((score, index, name));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        current = ifaddr.ifa_next;
+    }
+    unsafe {
+        libc::freeifaddrs(ifaddrs);
+    }
+
+    best.map(|(_, index, name)| {
+        crate::diag_log(format!(
+            "[libreatrust][transport] selected active physical interface {name} if_index={index}"
+        ));
+        index
+    })
+}
+
+fn interface_flags_are_usable(flags: libc::c_uint) -> bool {
+    flags & (libc::IFF_UP as libc::c_uint) != 0
+        && flags & (libc::IFF_RUNNING as libc::c_uint) != 0
+        && flags & (libc::IFF_LOOPBACK as libc::c_uint) == 0
+        && flags & (libc::IFF_POINTOPOINT as libc::c_uint) == 0
+}
+
+fn is_physical_interface_name(name: &str) -> bool {
+    !(name.starts_with("utun")
+        || name.starts_with("lo")
+        || name.starts_with("awdl")
+        || name.starts_with("llw")
+        || name.starts_with("bridge")
+        || name.starts_with("gif")
+        || name.starts_with("stf")
+        || name.starts_with("vmnet")
+        || name.starts_with("vmenet"))
+}
+
+fn physical_interface_score(name: &str) -> i32 {
+    if name.starts_with("en") {
+        100
+    } else if name.starts_with("pdp_ip") {
+        80
+    } else {
+        10
+    }
+}
+
+fn route_field(text: &str, name: &str) -> Option<String> {
+    text.lines().find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        if key.trim() == name {
+            Some(value.trim().to_string())
+        } else {
+            None
+        }
+    })
+}
+
+fn set_nonblocking(fd: libc::c_int, enabled: bool) -> AtrResult<()> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(AtrError::from(std::io::Error::last_os_error()));
+    }
+    let new_flags = if enabled {
+        flags | libc::O_NONBLOCK
+    } else {
+        flags & !libc::O_NONBLOCK
+    };
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, new_flags) } < 0 {
+        return Err(AtrError::from(std::io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+fn wait_for_connect(fd: libc::c_int, timeout: Duration) -> AtrResult<()> {
+    let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as libc::c_int;
+    let mut poll_fd = libc::pollfd {
+        fd,
+        events: libc::POLLOUT,
+        revents: 0,
+    };
+    loop {
+        let result = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) };
+        if result > 0 {
+            break;
+        }
+        if result == 0 {
+            return Err(AtrError::NetworkFailed("connect timed out".into()));
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() == ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(AtrError::from(err));
+    }
+
+    let mut error: libc::c_int = 0;
+    let mut len = std::mem::size_of_val(&error) as libc::socklen_t;
+    if unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_ERROR,
+            &mut error as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    } != 0
+    {
+        return Err(AtrError::from(std::io::Error::last_os_error()));
+    }
+    if error != 0 {
+        return Err(AtrError::from(std::io::Error::from_raw_os_error(error)));
+    }
+    Ok(())
+}
+
+fn sockaddr_storage(addr: &SocketAddr) -> (libc::sockaddr_storage, usize) {
+    match addr {
+        SocketAddr::V4(v4) => {
+            let mut storage = unsafe { std::mem::zeroed::<libc::sockaddr_storage>() };
+            let raw = libc::sockaddr_in {
+                sin_len: std::mem::size_of::<libc::sockaddr_in>() as u8,
+                sin_family: libc::AF_INET as u8,
+                sin_port: v4.port().to_be(),
+                sin_addr: libc::in_addr {
+                    s_addr: u32::from_ne_bytes(v4.ip().octets()),
+                },
+                sin_zero: [0; 8],
+            };
+            unsafe {
+                std::ptr::write(&mut storage as *mut _ as *mut libc::sockaddr_in, raw);
+            }
+            (storage, std::mem::size_of::<libc::sockaddr_in>())
+        }
+        SocketAddr::V6(v6) => {
+            let mut storage = unsafe { std::mem::zeroed::<libc::sockaddr_storage>() };
+            let raw = libc::sockaddr_in6 {
+                sin6_len: std::mem::size_of::<libc::sockaddr_in6>() as u8,
+                sin6_family: libc::AF_INET6 as u8,
+                sin6_port: v6.port().to_be(),
+                sin6_flowinfo: v6.flowinfo(),
+                sin6_addr: libc::in6_addr {
+                    s6_addr: v6.ip().octets(),
+                },
+                sin6_scope_id: v6.scope_id(),
+            };
+            unsafe {
+                std::ptr::write(&mut storage as *mut _ as *mut libc::sockaddr_in6, raw);
+            }
+            (storage, std::mem::size_of::<libc::sockaddr_in6>())
+        }
     }
 }
 
@@ -1124,7 +1443,14 @@ fn connect_tls(
     addr: &str,
     cfg: &crate::types::ClientConfig,
 ) -> AtrResult<StreamOwned<ClientConnection, TcpStream>> {
-    let tcp = TcpStream::connect(addr).map_err(|e| AtrError::NetworkFailed(e.to_string()))?;
+    let socket_addr = addr
+        .to_socket_addrs()?
+        .next()
+        .ok_or_else(|| AtrError::NetworkFailed(format!("failed to resolve {addr}")))?;
+    let tcp = connect_tcp_bound(
+        &socket_addr,
+        Duration::from_millis(cfg.connect_timeout_ms.max(1)),
+    )?;
     tcp.set_write_timeout(Some(Duration::from_millis(cfg.io_timeout_ms)))?;
     let host = addr.split(':').next().unwrap_or(addr);
     let server_name = ServerName::try_from(host.to_string())
