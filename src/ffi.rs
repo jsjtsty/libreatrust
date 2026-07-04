@@ -3,7 +3,9 @@
 use crate::auth::AuthSession;
 use crate::client::AtrClient;
 use crate::error::{AtrError, AtrResult, ErrorCode};
-use crate::proxy_service::{ProxyService, ProxyServiceConfig, ProxyServiceEvent, ProxyServiceStatus};
+use crate::proxy_service::{
+    ProxyService, ProxyServiceConfig, ProxyServiceEvent, ProxyServiceStatus,
+};
 use crate::resource::{DomainResource, IpResource, ResourceSnapshot, parse_resource_bytes};
 use crate::transport::{L3Tunnel, TcpTunnel, UdpTunnel};
 use crate::types::{
@@ -908,7 +910,9 @@ fn session_material_from_ffi(input: &atr_session_material_input_t) -> AtrResult<
     })
 }
 
-fn proxy_service_config_from_ffi(input: &atr_proxy_service_config_t) -> AtrResult<ProxyServiceConfig> {
+fn proxy_service_config_from_ffi(
+    input: &atr_proxy_service_config_t,
+) -> AtrResult<ProxyServiceConfig> {
     let mut config = ProxyServiceConfig::default();
     config.listen_host = cstr_to_string(input.listen_host, "listen_host")?;
     config.listen_port = input.listen_port;
@@ -1955,8 +1959,7 @@ pub extern "C" fn atr_proxy_service_get_stats(
     }
     let result = (|| -> Result<(), AtrError> {
         let stats = unsafe { &*service }.inner.stats();
-        let (last_event_kind, last_event_message) =
-            proxy_service_event_to_ffi(stats.last_event)?;
+        let (last_event_kind, last_event_message) = proxy_service_event_to_ffi(stats.last_event)?;
         let last_error = match stats.last_error {
             Some(error) => CString::new(error)
                 .map_err(|err| AtrError::Internal(err.to_string()))?

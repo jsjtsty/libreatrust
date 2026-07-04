@@ -239,6 +239,10 @@ pub fn route(
     port: u16,
     protocol: ProtocolKind,
 ) -> RouteDecision {
+    if is_node_endpoint(snapshot, host, port) {
+        return RouteDecision::Direct;
+    }
+
     if let Ok(ip) = host.parse::<Ipv4Addr>() {
         if let Some(hit) = match_ip(snapshot, ip, port, protocol) {
             return RouteDecision::Managed(hit);
@@ -250,6 +254,27 @@ pub fn route(
         return RouteDecision::Managed(hit);
     }
     RouteDecision::Direct
+}
+
+fn is_node_endpoint(snapshot: &ResourceSnapshot, host: &str, port: u16) -> bool {
+    let host = host.trim().trim_matches(['[', ']']);
+    snapshot.node_groups.values().flatten().any(|endpoint| {
+        let Some((node_host, node_port)) = split_host_port(endpoint) else {
+            return false;
+        };
+        node_port == port && node_host.eq_ignore_ascii_case(host)
+    })
+}
+
+fn split_host_port(endpoint: &str) -> Option<(&str, u16)> {
+    let endpoint = endpoint.trim();
+    let (host, port) = endpoint.rsplit_once(':')?;
+    let host = host.trim().trim_matches(['[', ']']);
+    if host.is_empty() {
+        return None;
+    }
+    let port = port.trim().parse::<u16>().ok()?;
+    Some((host, port))
 }
 
 #[allow(dead_code)]
@@ -482,5 +507,31 @@ mod tests {
         assert!(matches!(apex, RouteDecision::Managed(_)));
         assert!(matches!(subdomain, RouteDecision::Managed(_)));
         assert!(matches!(unrelated, RouteDecision::Direct));
+    }
+
+    #[test]
+    fn routes_node_endpoint_directly() {
+        let mut snapshot = ResourceSnapshot::default();
+        snapshot.node_groups.insert(
+            "group".into(),
+            vec!["202.118.253.228:441".into(), "node.example.com:441".into()],
+        );
+        snapshot.ip_resources.push(IpResource {
+            ip_min: "202.118.253.1".parse().unwrap(),
+            ip_max: "202.118.253.254".parse().unwrap(),
+            port_min: 1,
+            port_max: u16::MAX,
+            protocol: "tcp".into(),
+            app_id: "app".into(),
+            node_group_id: "group".into(),
+        });
+
+        let node_ip = route(&snapshot, "202.118.253.228", 441, ProtocolKind::Tcp);
+        let node_host = route(&snapshot, "node.example.com", 441, ProtocolKind::Tcp);
+        let managed = route(&snapshot, "202.118.253.10", 441, ProtocolKind::Tcp);
+
+        assert!(matches!(node_ip, RouteDecision::Direct));
+        assert!(matches!(node_host, RouteDecision::Direct));
+        assert!(matches!(managed, RouteDecision::Managed(_)));
     }
 }

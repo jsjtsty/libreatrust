@@ -60,6 +60,10 @@ impl TcpTunnel {
         let node_addr = client.best_node_for(&hit.node_group_id).ok_or_else(|| {
             AtrError::NotFound(format!("no node for group {}", hit.node_group_id))
         })?;
+        crate::diag_log(format!(
+            "[libreatrust][tcp] connect begin target={host}:{port} app={} node_group={} node={node_addr}",
+            hit.app_id, hit.node_group_id
+        ));
         let session = client
             .session()
             .ok_or_else(|| AtrError::InvalidState("session not set".into()))?;
@@ -72,6 +76,9 @@ impl TcpTunnel {
         validate_tcp_tunnel_auth(&mut stream)?;
         send_tcp_dest(&mut stream, host, port)?;
         stream.sock.set_read_timeout(None)?;
+        crate::diag_log(format!(
+            "[libreatrust][tcp] connect ready target={host}:{port}"
+        ));
 
         let (incoming_tx, incoming_rx) = mpsc::channel();
         let (write_tx, write_rx) = mpsc::channel();
@@ -408,10 +415,10 @@ fn validate_tcp_tunnel_auth(
                 let mut marker = [0u8; 2];
                 read_tunnel_exact_blocking(stream, &mut marker)?;
                 if marker != [0x53, 0x00] {
-                    eprintln!(
+                    crate::diag_log(format!(
                         "[libreatrust][tcp] ignoring tunnel auth marker {:02x?}",
                         marker
-                    );
+                    ));
                     continue;
                 }
 
@@ -421,7 +428,7 @@ fn validate_tcp_tunnel_auth(
                 let mut payload = vec![0u8; len];
                 read_tunnel_exact_blocking(stream, &mut payload)?;
                 let text = String::from_utf8_lossy(&payload);
-                eprintln!("[libreatrust][tcp] tunnel auth response {}", text);
+                crate::diag_log(format!("[libreatrust][tcp] tunnel auth response {}", text));
                 if text.contains(r#""message":"OK""#) || text.contains(r#""message":"Succeeded""#) {
                     return Ok(());
                 }
@@ -430,10 +437,10 @@ fn validate_tcp_tunnel_auth(
             [0x05, status] => {
                 let mut tail = [0u8; 8];
                 read_tunnel_exact_blocking(stream, &mut tail)?;
-                eprintln!(
+                crate::diag_log(format!(
                     "[libreatrust][tcp] ignoring tunnel control status={:02x} tail={:02x?}",
                     status, tail
-                );
+                ));
             }
             [0x01, 0x00] => {
                 return Err(AtrError::NetworkFailed(
@@ -449,10 +456,10 @@ fn validate_tcp_tunnel_auth(
                 )));
             }
             _ => {
-                eprintln!(
+                crate::diag_log(format!(
                     "[libreatrust][tcp] ignoring tunnel auth header {:02x} {:02x}",
                     header[0], header[1]
-                );
+                ));
             }
         }
     }
@@ -517,10 +524,10 @@ fn read_tcp_frame(
             let mut marker = [0u8; 2];
             read_tunnel_exact_blocking(stream, &mut marker)?;
             if marker != [0x53, 0x00] {
-                eprintln!(
+                crate::diag_log(format!(
                     "[libreatrust][tcp] ignoring tunnel auth marker {:02x?}",
                     marker
-                );
+                ));
                 return Ok(None);
             }
 
@@ -530,7 +537,7 @@ fn read_tcp_frame(
             let mut payload = vec![0u8; len];
             read_tunnel_exact_blocking(stream, &mut payload)?;
             let text = String::from_utf8_lossy(&payload);
-            eprintln!("[libreatrust][tcp] tunnel auth response {}", text);
+            crate::diag_log(format!("[libreatrust][tcp] tunnel auth response {}", text));
             if !text.contains(r#""message":"OK""#) && !text.contains(r#""message":"Succeeded""#) {
                 return Err(AtrError::NetworkFailed(text.into_owned()));
             }
@@ -539,17 +546,17 @@ fn read_tcp_frame(
         [0x05, status] => {
             let mut tail = [0u8; 8];
             read_tunnel_exact_blocking(stream, &mut tail)?;
-            eprintln!(
+            crate::diag_log(format!(
                 "[libreatrust][tcp] ignoring tunnel control status={:02x} tail={:02x?}",
                 status, tail
-            );
+            ));
             Ok(None)
         }
         _ => {
-            eprintln!(
+            crate::diag_log(format!(
                 "[libreatrust][tcp] ignoring tunnel header {:02x} {:02x}",
                 header[0], header[1]
-            );
+            ));
             Ok(None)
         }
     }

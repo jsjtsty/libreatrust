@@ -184,6 +184,9 @@ fn run_listener(
                     .name("libreatrust-proxy-conn".into())
                     .spawn(move || {
                         if let Err(err) = handle_connection(stream, client, config) {
+                            crate::diag_log(format!(
+                                "[libreatrust][proxy] connection failed: {err}"
+                            ));
                             record_proxy_error(&error_slot, &event_slot, err);
                         }
                         active.fetch_sub(1, Ordering::Relaxed);
@@ -242,7 +245,9 @@ fn handle_connection(
     match first[0] {
         0x05 if config.enable_socks5 => handle_socks5(client_stream, first, client, config),
         _ if config.enable_http => handle_http(client_stream, first, client, config),
-        _ => Err(AtrError::InvalidArgument("unsupported proxy protocol".into())),
+        _ => Err(AtrError::InvalidArgument(
+            "unsupported proxy protocol".into(),
+        )),
     }
 }
 
@@ -255,7 +260,9 @@ fn handle_socks5(
     while parse_socks5_greeting(&buffer)?.is_none() {
         append_read(&mut client_stream, &mut buffer)?;
         if buffer.len() > MAX_HEADER_SIZE {
-            return Err(AtrError::InvalidArgument("socks5 greeting too large".into()));
+            return Err(AtrError::InvalidArgument(
+                "socks5 greeting too large".into(),
+            ));
         }
     }
     client_stream.write_all(&[0x05, 0x00])?;
@@ -272,6 +279,12 @@ fn handle_socks5(
         }
     };
 
+    crate::diag_log(format!(
+        "[libreatrust][proxy] socks5 connect target={}:{} leftover={}B",
+        request.host,
+        request.port,
+        request.leftover.len()
+    ));
     match open_proxy_target(&client, &request.host, request.port, &config) {
         Ok(remote) => {
             client_stream.write_all(&socks5_reply(0x00))?;
@@ -298,13 +311,18 @@ fn handle_http(
     while find_header_end(&buffer).is_none() {
         append_read(&mut client_stream, &mut buffer)?;
         if buffer.len() > MAX_HEADER_SIZE {
-            return Err(AtrError::InvalidArgument("http proxy header too large".into()));
+            return Err(AtrError::InvalidArgument(
+                "http proxy header too large".into(),
+            ));
         }
     }
     let request = parse_http_proxy_request(&buffer)?;
 
     if request.method.eq_ignore_ascii_case("CONNECT") {
         let (host, port) = parse_host_port(&request.target, 443)?;
+        crate::diag_log(format!(
+            "[libreatrust][proxy] http CONNECT target={host}:{port}"
+        ));
         match open_proxy_target(&client, &host, port, &config) {
             Ok(remote) => {
                 client_stream.write_all(
@@ -317,13 +335,19 @@ fn handle_http(
                 relay(client_stream, remote)
             }
             Err(err) => {
-                let _ = client_stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+                let _ = client_stream.write_all(
+                    b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+                );
                 let _ = client_stream.flush();
                 Err(err)
             }
         }
     } else {
         let (host, port, rewritten) = rewrite_http_proxy_request(request)?;
+        crate::diag_log(format!(
+            "[libreatrust][proxy] http request target={host}:{port} rewritten={}B",
+            rewritten.len()
+        ));
         let remote = open_proxy_target(&client, &host, port, &config)?;
         remote.write_all(&rewritten)?;
         remote.flush()?;
@@ -339,15 +363,22 @@ fn open_proxy_target(
 ) -> AtrResult<ProxyRemote> {
     let route = resolved_tcp_route(client, host, port)?;
     match route.decision {
-        ProxyRouteDecision::Managed => Ok(ProxyRemote::Managed(client.open_tcp_tunnel(
-            &route.connect_host,
-            port,
-        )?)),
+        ProxyRouteDecision::Managed => {
+            crate::diag_log(format!(
+                "[libreatrust][proxy] route managed requested={host}:{port} connect={}:{}",
+                route.connect_host, port
+            ));
+            Ok(ProxyRemote::Managed(
+                client.open_tcp_tunnel(&route.connect_host, port)?,
+            ))
+        }
         ProxyRouteDecision::Direct => {
-            let addr = (host, port)
-                .to_socket_addrs()?
-                .next()
-                .ok_or_else(|| AtrError::NetworkFailed(format!("failed to resolve {host}:{port}")))?;
+            let addr = (host, port).to_socket_addrs()?.next().ok_or_else(|| {
+                AtrError::NetworkFailed(format!("failed to resolve {host}:{port}"))
+            })?;
+            crate::diag_log(format!(
+                "[libreatrust][proxy] route direct requested={host}:{port} connect={addr}"
+            ));
             let stream = TcpStream::connect_timeout(
                 &addr,
                 Duration::from_millis(config.connect_timeout_ms.max(1)),
@@ -372,6 +403,7 @@ enum ProxyRouteDecision {
 
 fn resolved_tcp_route(client: &AtrClient, host: &str, port: u16) -> AtrResult<ResolvedProxyRoute> {
     if matches!(client.route_tcp(host, port), RouteDecision::Managed(_)) {
+        crate::diag_log(format!("[libreatrust][proxy] route hit host={host}:{port}"));
         return Ok(ResolvedProxyRoute {
             decision: ProxyRouteDecision::Managed,
             connect_host: host.to_string(),
@@ -386,6 +418,9 @@ fn resolved_tcp_route(client: &AtrClient, host: &str, port: u16) -> AtrResult<Re
 
     for ip in resolve_ipv4_addresses(host) {
         if matches!(client.route_tcp(&ip, port), RouteDecision::Managed(_)) {
+            crate::diag_log(format!(
+                "[libreatrust][proxy] route hit resolved host={host}:{port} ip={ip}"
+            ));
             return Ok(ResolvedProxyRoute {
                 decision: ProxyRouteDecision::Managed,
                 connect_host: ip,
@@ -456,12 +491,22 @@ fn relay(client_stream: TcpStream, remote: ProxyRemote) -> AtrResult<()> {
             let downstream_remote = remote_reader.try_clone()?;
             let upstream = thread::spawn(move || {
                 let result = copy_tcp_to_tcp(client_reader, remote_writer);
+                if let Err(err) = &result {
+                    crate::diag_log(format!(
+                        "[libreatrust][proxy] relay direct client->remote failed: {err}"
+                    ));
+                }
                 let _ = upstream_remote.shutdown(Shutdown::Write);
                 let _ = upstream_client.shutdown(Shutdown::Read);
                 result
             });
             let downstream = thread::spawn(move || {
                 let result = copy_tcp_to_tcp(remote_reader, client_writer);
+                if let Err(err) = &result {
+                    crate::diag_log(format!(
+                        "[libreatrust][proxy] relay direct remote->client failed: {err}"
+                    ));
+                }
                 let _ = downstream_client.shutdown(Shutdown::Write);
                 let _ = downstream_remote.shutdown(Shutdown::Read);
                 result
@@ -479,14 +524,23 @@ fn relay(client_stream: TcpStream, remote: ProxyRemote) -> AtrResult<()> {
             let tunnel_writer = tunnel.clone();
             let client_shutdown = client_writer.try_clone()?;
             let tunnel_shutdown = tunnel.clone();
-            let upstream =
-                thread::spawn(move || {
-                    let result = copy_tcp_to_tunnel(client_reader, tunnel_writer.as_ref());
-                    let _ = tunnel_writer.close();
-                    result
-                });
+            let upstream = thread::spawn(move || {
+                let result = copy_tcp_to_tunnel(client_reader, tunnel_writer.as_ref());
+                if let Err(err) = &result {
+                    crate::diag_log(format!(
+                        "[libreatrust][proxy] relay managed client->tunnel failed: {err}"
+                    ));
+                }
+                let _ = tunnel_writer.close();
+                result
+            });
             let downstream = thread::spawn(move || {
                 let result = copy_tunnel_to_tcp(tunnel.as_ref(), client_writer);
+                if let Err(err) = &result {
+                    crate::diag_log(format!(
+                        "[libreatrust][proxy] relay managed tunnel->client failed: {err}"
+                    ));
+                }
                 let _ = client_shutdown.shutdown(Shutdown::Both);
                 let _ = tunnel_shutdown.close();
                 result
@@ -631,7 +685,11 @@ fn parse_socks5_connect(buffer: &[u8]) -> AtrResult<Option<Socks5ConnectRequest>
             octets.copy_from_slice(&buffer[4..20]);
             (std::net::Ipv6Addr::from(octets).to_string(), 20)
         }
-        _ => return Err(AtrError::Unsupported("unsupported socks5 address type".into())),
+        _ => {
+            return Err(AtrError::Unsupported(
+                "unsupported socks5 address type".into(),
+            ));
+        }
     };
     if buffer.len() < cursor + 2 {
         return Ok(None);
@@ -697,10 +755,9 @@ fn parse_http_proxy_request(buffer: &[u8]) -> AtrResult<HttpProxyRequest> {
 }
 
 fn rewrite_http_proxy_request(request: HttpProxyRequest) -> AtrResult<(String, u16, Vec<u8>)> {
-    let (scheme, rest) = request
-        .target
-        .split_once("://")
-        .ok_or_else(|| AtrError::InvalidArgument("http proxy request target is not absolute".into()))?;
+    let (scheme, rest) = request.target.split_once("://").ok_or_else(|| {
+        AtrError::InvalidArgument("http proxy request target is not absolute".into())
+    })?;
     let default_port = if scheme.eq_ignore_ascii_case("https") {
         443
     } else {
@@ -708,7 +765,11 @@ fn rewrite_http_proxy_request(request: HttpProxyRequest) -> AtrResult<(String, u
     };
     let slash = rest.find('/').unwrap_or(rest.len());
     let authority = &rest[..slash];
-    let path = if slash < rest.len() { &rest[slash..] } else { "/" };
+    let path = if slash < rest.len() {
+        &rest[slash..]
+    } else {
+        "/"
+    };
     let (host, port) = parse_host_port(authority, default_port)?;
     let mut output = Vec::new();
     output.extend_from_slice(
