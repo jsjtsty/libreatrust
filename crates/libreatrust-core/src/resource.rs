@@ -233,7 +233,7 @@ pub fn parse_resource_bytes(resource: &[u8], service_host: &str) -> AtrResult<Re
     Ok(snapshot)
 }
 
-pub fn route(
+pub(crate) fn route(
     snapshot: &ResourceSnapshot,
     host: &str,
     port: u16,
@@ -278,7 +278,7 @@ fn split_host_port(endpoint: &str) -> Option<(&str, u16)> {
 }
 
 #[allow(dead_code)]
-pub fn ip_in_resources(
+pub(crate) fn ip_in_resources(
     snapshot: &ResourceSnapshot,
     ip: Ipv4Addr,
     port: u16,

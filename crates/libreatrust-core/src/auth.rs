@@ -510,7 +510,7 @@ impl AuthSession {
                 qp.append_pair(k, v);
             }
         }
-        eprintln!("[libreatrust][auth] GET {}", url);
+        crate::diag_log(format!("[libreatrust][auth] GET {}", url));
         let resp = self
             .client
             .get(url)
@@ -520,18 +520,24 @@ impl AuthSession {
             .header("x-sdp-traceid", self.trace_id())
             .send()
             .map_err(|err| {
-                eprintln!("[libreatrust][auth] authConfig request failed: {}", err);
+                crate::diag_log(format!(
+                    "[libreatrust][auth] authConfig request failed: {}",
+                    err
+                ));
                 err
             })?;
         let status = resp.status();
         self.capture_cookies(&resp)?;
         let body = resp.text()?;
-        eprintln!(
+        crate::diag_log(format!(
             "[libreatrust][auth] authConfig response status={} body={}",
             status, body
-        );
+        ));
         let parsed: AuthConfigResponse = serde_json::from_str(&body).map_err(|err| {
-            eprintln!("[libreatrust][auth] authConfig parse failed: {}", err);
+            crate::diag_log(format!(
+                "[libreatrust][auth] authConfig parse failed: {}",
+                err
+            ));
             err
         })?;
         self.csrf_token = if parsed.data.csrf_token.is_empty() {

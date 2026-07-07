@@ -1,6 +1,4 @@
-use crate::resource::ResourceSnapshot;
 use serde::{Deserialize, Serialize};
-use std::net::IpAddr;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientConfig {
@@ -144,44 +142,4 @@ pub struct RouteHit {
 pub enum RouteDecision {
     Direct,
     Managed(RouteHit),
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RouteProbe {
-    pub host: String,
-    pub port: u16,
-    pub protocol: ProtocolKind,
-}
-
-#[allow(dead_code)]
-impl RouteProbe {
-    pub fn from_ip(ip: IpAddr, port: u16, protocol: ProtocolKind) -> Self {
-        Self {
-            host: ip.to_string(),
-            port,
-            protocol,
-        }
-    }
-}
-
-#[allow(dead_code)]
-pub fn session_from_resource(
-    resource: &ResourceSnapshot,
-    username: String,
-    sid: String,
-    device_id: String,
-    connection_id: String,
-    sign_key_hex: String,
-    cookies: Vec<CookieRecord>,
-) -> SessionMaterial {
-    let _ = resource;
-    SessionMaterial {
-        username,
-        sid,
-        device_id,
-        connection_id,
-        sign_key_hex,
-        cookies,
-    }
 }

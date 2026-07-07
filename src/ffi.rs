@@ -1,16 +1,10 @@
 #![allow(non_camel_case_types)]
 
-use crate::auth::AuthSession;
-use crate::client::AtrClient;
-use crate::error::{AtrError, AtrResult, ErrorCode};
-use crate::proxy_service::{
-    ProxyService, ProxyServiceConfig, ProxyServiceEvent, ProxyServiceStatus,
-};
-use crate::resource::{DomainResource, IpResource, ResourceSnapshot, parse_resource_bytes};
-use crate::transport::{L3Tunnel, TcpTunnel, UdpTunnel};
-use crate::types::{
-    AuthChallenge, AuthChallengeKind, AuthConfig, CallbackTarget, ClientConfig, CookieRecord,
-    PasswordLoginInput, SessionMaterial, SmsLoginInput,
+use libreatrust_core::{
+    AtrClient, AtrError, AtrResult, AuthChallenge, AuthChallengeKind, AuthConfig, AuthSession,
+    CallbackTarget, ClientConfig, CookieRecord, DomainResource, ErrorCode, IpResource, L3Tunnel,
+    PasswordLoginInput, ProxyService, ProxyServiceConfig, ProxyServiceEvent, ProxyServiceStatus,
+    ResourceSnapshot, SessionMaterial, SmsLoginInput, TcpTunnel, UdpTunnel, parse_resource_bytes,
 };
 use std::ffi::{CStr, CString};
 use std::net::Ipv4Addr;
@@ -1066,7 +1060,13 @@ pub extern "C" fn atr_client_route_tcp(
     port: u16,
     managed: *mut bool,
 ) -> i32 {
-    route(client, host, port, managed, crate::types::ProtocolKind::Tcp)
+    route(
+        client,
+        host,
+        port,
+        managed,
+        libreatrust_core::ProtocolKind::Tcp,
+    )
 }
 
 #[unsafe(no_mangle)]
@@ -1076,7 +1076,13 @@ pub extern "C" fn atr_client_route_udp(
     port: u16,
     managed: *mut bool,
 ) -> i32 {
-    route(client, host, port, managed, crate::types::ProtocolKind::Udp)
+    route(
+        client,
+        host,
+        port,
+        managed,
+        libreatrust_core::ProtocolKind::Udp,
+    )
 }
 
 #[unsafe(no_mangle)]
@@ -1085,7 +1091,13 @@ pub extern "C" fn atr_client_route_icmp(
     host: *const c_char,
     managed: *mut bool,
 ) -> i32 {
-    route(client, host, 0, managed, crate::types::ProtocolKind::Icmp)
+    route(
+        client,
+        host,
+        0,
+        managed,
+        libreatrust_core::ProtocolKind::Icmp,
+    )
 }
 
 #[unsafe(no_mangle)]
@@ -1187,7 +1199,7 @@ fn route(
     host: *const c_char,
     port: u16,
     managed: *mut bool,
-    kind: crate::types::ProtocolKind,
+    kind: libreatrust_core::ProtocolKind,
 ) -> i32 {
     if client.is_null() || host.is_null() || managed.is_null() {
         return ErrorCode::InvalidArgument as i32;
@@ -1200,12 +1212,12 @@ fn route(
             .to_str()
             .map_err(|e| AtrError::ParseFailed(e.to_string()))?;
         let decision = match kind {
-            crate::types::ProtocolKind::Tcp => unsafe { &*client }.inner.route_tcp(host, port),
-            crate::types::ProtocolKind::Udp => unsafe { &*client }.inner.route_udp(host, port),
-            crate::types::ProtocolKind::Icmp => unsafe { &*client }.inner.route_icmp(host),
+            libreatrust_core::ProtocolKind::Tcp => unsafe { &*client }.inner.route_tcp(host, port),
+            libreatrust_core::ProtocolKind::Udp => unsafe { &*client }.inner.route_udp(host, port),
+            libreatrust_core::ProtocolKind::Icmp => unsafe { &*client }.inner.route_icmp(host),
         };
         unsafe {
-            *managed = matches!(decision, crate::types::RouteDecision::Managed(_));
+            *managed = matches!(decision, libreatrust_core::RouteDecision::Managed(_));
         }
         Ok(())
     })();

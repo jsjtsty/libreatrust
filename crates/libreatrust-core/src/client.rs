@@ -85,6 +85,15 @@ impl AtrClient {
         })
     }
 
+    pub fn best_node(&self) -> Option<String> {
+        self.resource.as_ref().and_then(|res| {
+            res.best_nodes
+                .get(&res.major_node_group)
+                .cloned()
+                .or_else(|| res.best_nodes.values().next().cloned())
+        })
+    }
+
     pub fn build_request_sig(&self, data: &[u8]) -> AtrResult<String> {
         let session = self
             .session

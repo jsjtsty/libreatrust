@@ -17,7 +17,7 @@ use std::io::{ErrorKind, Read, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::net::UnixStream;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, SystemTime};
@@ -1081,6 +1081,10 @@ impl L3Tunnel {
             }
         };
 
+        crate::diag_log(format!(
+            "[libreatrust][l3] packet route dst={}:{} proto={:?} app={} node_group={}",
+            meta.dst_ip, meta.dst_port, meta.protocol, hit.app_id, hit.node_group_id
+        ));
         let remote = self.remote_for(&hit.node_group_id)?;
         remote.write_packet(meta, &hit.app_id, &hit.node_group_id, packet)?;
         Ok(packet.len())
@@ -1109,6 +1113,9 @@ impl L3Tunnel {
             .client
             .best_node_for(node_group_id)
             .ok_or_else(|| AtrError::NotFound(format!("no node for group {node_group_id}")))?;
+        crate::diag_log(format!(
+            "[libreatrust][l3] remote connect begin node_group={node_group_id} node={node_addr}"
+        ));
         let session = self
             .client
             .session()
@@ -1125,6 +1132,9 @@ impl L3Tunnel {
             .lock()
             .unwrap()
             .insert(node_group_id.to_string(), remote.clone());
+        crate::diag_log(format!(
+            "[libreatrust][l3] remote connect ready node_group={node_group_id}"
+        ));
         Ok(remote)
     }
 }
@@ -1203,6 +1213,7 @@ struct L3Remote {
     sign_key: Vec<u8>,
     conntracks: Arc<ConntrackMgr>,
     close_flag: Arc<AtomicBool>,
+    write_interest: Arc<AtomicUsize>,
     vip_list: Arc<Mutex<Vec<Ipv4Addr>>>,
 }
 
@@ -1225,6 +1236,10 @@ impl L3Remote {
         vip_list: Arc<Mutex<Vec<Ipv4Addr>>>,
     ) -> AtrResult<Self> {
         let stream = connect_tls(&addr, client.client_config())?;
+        set_no_sigpipe(stream.sock.as_raw_fd());
+        stream.sock.set_read_timeout(Some(Duration::from_millis(
+            client.client_config().io_timeout_ms,
+        )))?;
         let remote = Self {
             stream: Arc::new(Mutex::new(stream)),
             info: L3ClientInfo {
@@ -1236,9 +1251,16 @@ impl L3Remote {
                 .map_err(|e| AtrError::CryptoFailed(e.to_string()))?,
             conntracks: Arc::new(ConntrackMgr::new()),
             close_flag: Arc::new(AtomicBool::new(false)),
+            write_interest: Arc::new(AtomicUsize::new(0)),
             vip_list,
         };
         remote.auth_tunnel()?;
+        {
+            let stream = remote.stream.lock().unwrap();
+            stream
+                .sock
+                .set_read_timeout(Some(Duration::from_millis(5)))?;
+        }
         remote.spawn_loops(incoming_tx);
         Ok(remote)
     }
@@ -1247,8 +1269,10 @@ impl L3Remote {
         let reader = self.stream.clone();
         let conntracks = self.conntracks.clone();
         let close = self.close_flag.clone();
+        let write_interest = self.write_interest.clone();
         let heartbeat_stream = self.stream.clone();
         let heartbeat_close = self.close_flag.clone();
+        let heartbeat_write_interest = self.write_interest.clone();
         let vip_list = self.vip_list.clone();
 
         thread::spawn(move || {
@@ -1256,12 +1280,17 @@ impl L3Remote {
                 if close.load(Ordering::SeqCst) {
                     break;
                 }
+                if write_interest.load(Ordering::SeqCst) > 0 {
+                    thread::sleep(Duration::from_millis(1));
+                    continue;
+                }
                 let frame = {
                     let mut stream = reader.lock().unwrap();
-                    read_l3_frame(&mut *stream)
+                    read_l3_frame_available(&mut *stream)
                 };
                 let frame = match frame {
-                    Ok(v) => v,
+                    Ok(Some(v)) => v,
+                    Ok(None) => continue,
                     Err(_) => break,
                 };
                 match frame.cmd {
@@ -1291,9 +1320,11 @@ impl L3Remote {
         thread::spawn(move || {
             while !heartbeat_close.load(Ordering::SeqCst) {
                 thread::sleep(Duration::from_secs(25));
+                heartbeat_write_interest.fetch_add(1, Ordering::SeqCst);
                 let mut stream = heartbeat_stream.lock().unwrap();
                 let _ = stream.write_all(&[0x05, 0x15, 0x00, 0x00]);
                 let _ = stream.flush();
+                heartbeat_write_interest.fetch_sub(1, Ordering::SeqCst);
             }
         });
     }
@@ -1303,6 +1334,7 @@ impl L3Remote {
         let packet = wrap_auth_req_data(&req, 1);
         {
             let mut stream = self.stream.lock().unwrap();
+            crate::diag_log("[libreatrust][l3] tunnel auth send sid".to_string());
             stream.write_all(&packet)?;
             stream.flush()?;
         }
@@ -1310,6 +1342,9 @@ impl L3Remote {
         let mut stream = self.stream.lock().unwrap();
         let mut method = [0u8; 2];
         stream.read_exact(&mut method)?;
+        crate::diag_log(format!(
+            "[libreatrust][l3] tunnel auth method={method:02x?}"
+        ));
         if method != [0x05, 0xD0] {
             return Err(AtrError::NetworkFailed(format!(
                 "unexpected auth method {:?}",
@@ -1319,6 +1354,9 @@ impl L3Remote {
 
         let mut header = [0u8; 4];
         stream.read_exact(&mut header)?;
+        crate::diag_log(format!(
+            "[libreatrust][l3] tunnel auth header={header:02x?}"
+        ));
         if header[0] != 0x53 {
             return Err(AtrError::NetworkFailed(format!(
                 "unexpected auth header {:02x?}",
@@ -1330,6 +1368,12 @@ impl L3Remote {
         let mut payload = vec![0u8; len];
         if len > 0 {
             stream.read_exact(&mut payload)?;
+        }
+        if !payload.is_empty() {
+            crate::diag_log(format!(
+                "[libreatrust][l3] tunnel auth payload {}",
+                String::from_utf8_lossy(&payload)
+            ));
         }
         if status != 0 {
             return Err(AtrError::Unauthorized(
@@ -1346,16 +1390,27 @@ impl L3Remote {
             }
         }
         let mut vip_header = [0u8; 4];
-        if stream.read_exact(&mut vip_header).is_ok() && vip_header[0] == 0x05 {
+        if read_tunnel_exact(&mut *stream, &mut vip_header)? && vip_header[0] == 0x05 {
+            crate::diag_log(format!(
+                "[libreatrust][l3] tunnel auth optional vip header={vip_header:02x?}"
+            ));
             let data_len = vip_payload_length(vip_header[3]);
             if data_len > 0 {
                 let mut vip_data = vec![0u8; data_len];
-                stream.read_exact(&mut vip_data)?;
+                read_tunnel_exact_blocking(&mut *stream, &mut vip_data)?;
                 if let Some(ips) = parse_virtual_ip_bytes(&vip_data) {
+                    crate::diag_log(format!(
+                        "[libreatrust][l3] tunnel auth vip={}",
+                        ips.iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    ));
                     *self.vip_list.lock().unwrap() = ips;
                 }
             }
         }
+        crate::diag_log("[libreatrust][l3] tunnel auth ready".to_string());
         Ok(())
     }
 
@@ -1369,6 +1424,10 @@ impl L3Remote {
         let ct = self
             .conntracks
             .get_or_create(&conn_track_key(&meta), app_id, node_group_id);
+        crate::diag_log(format!(
+            "[libreatrust][l3] write begin key={} app={} node_group={}",
+            ct.key, app_id, node_group_id
+        ));
         self.ensure_auth(&ct, meta)?;
         let token = ct
             .connect_token
@@ -1377,9 +1436,16 @@ impl L3Remote {
             .clone()
             .ok_or_else(|| AtrError::InvalidState("missing connect token".into()))?;
         let payload = build_data_payload(&token, &[pkt.to_vec()]);
-        let mut stream = self.stream.lock().unwrap();
-        stream.write_all(&payload)?;
-        stream.flush()?;
+        self.write_interest.fetch_add(1, Ordering::SeqCst);
+        crate::diag_log(format!("[libreatrust][l3] data lock wait key={}", ct.key));
+        let write_result = {
+            let mut stream = self.stream.lock().unwrap();
+            crate::diag_log(format!("[libreatrust][l3] data lock acquired key={}", ct.key));
+            stream.write_all(&payload).and_then(|_| stream.flush())
+        };
+        self.write_interest.fetch_sub(1, Ordering::SeqCst);
+        write_result?;
+        crate::diag_log(format!("[libreatrust][l3] write ready key={}", ct.key));
         Ok(())
     }
 
@@ -1417,10 +1483,17 @@ impl L3Remote {
 
     fn send_auth_request(&self, ct: &Arc<Conntrack>, meta: PacketMeta) -> AtrResult<()> {
         let req = build_auth_request(&self.info, &self.sign_key, meta, ct)?;
-        let packet = wrap_auth_req_data(&req, 1);
-        let mut stream = self.stream.lock().unwrap();
-        stream.write_all(&packet)?;
-        stream.flush()?;
+        let packet = build_l3_auth_request_payload(&req)?;
+        self.write_interest.fetch_add(1, Ordering::SeqCst);
+        crate::diag_log(format!("[libreatrust][l3] auth lock wait key={}", ct.key));
+        let write_result = {
+            let mut stream = self.stream.lock().unwrap();
+            crate::diag_log(format!("[libreatrust][l3] auth lock acquired key={}", ct.key));
+            crate::diag_log(format!("[libreatrust][l3] auth request key={}", ct.key));
+            stream.write_all(&packet).and_then(|_| stream.flush())
+        };
+        self.write_interest.fetch_sub(1, Ordering::SeqCst);
+        write_result?;
         Ok(())
     }
 }
@@ -1506,58 +1579,62 @@ impl ServerCertVerifier for NoVerifier {
     }
 }
 
-fn read_l3_frame(stream: &mut StreamOwned<ClientConnection, TcpStream>) -> AtrResult<Frame> {
+fn read_l3_frame_available(
+    stream: &mut StreamOwned<ClientConnection, TcpStream>,
+) -> AtrResult<Option<Frame>> {
     loop {
         let mut header = [0u8; 2];
-        stream.read_exact(&mut header)?;
+        if !read_tunnel_exact(stream, &mut header)? {
+            return Ok(None);
+        }
         match header {
             [0x05, cmd] if cmd == 0x93 || cmd == 0x96 => {
                 let mut status_len = [0u8; 3];
-                stream.read_exact(&mut status_len)?;
+                read_tunnel_exact_blocking(stream, &mut status_len)?;
                 let status = status_len[0];
                 let len = u16::from_be_bytes([status_len[1], status_len[2]]) as usize;
                 let mut payload = vec![0u8; len];
                 if len > 0 {
-                    stream.read_exact(&mut payload)?;
+                    read_tunnel_exact_blocking(stream, &mut payload)?;
                 }
-                return Ok(Frame {
+                return Ok(Some(Frame {
                     cmd,
                     status,
                     payload,
                     data_mode: DataMode::Len,
-                });
+                }));
             }
             [0x05, 0x94] => {
                 let (payload, mode) = read_data_resp_payload(stream)?;
-                return Ok(Frame {
+                return Ok(Some(Frame {
                     cmd: 0x94,
                     status: 0,
                     payload,
                     data_mode: mode,
-                });
+                }));
             }
             [0x05, cmd] => {
                 let mut len_bytes = [0u8; 2];
-                stream.read_exact(&mut len_bytes)?;
+                read_tunnel_exact_blocking(stream, &mut len_bytes)?;
                 let len = u16::from_be_bytes(len_bytes) as usize;
                 let mut payload = vec![0u8; len];
                 if len > 0 {
-                    stream.read_exact(&mut payload)?;
+                    read_tunnel_exact_blocking(stream, &mut payload)?;
                 }
-                return Ok(Frame {
+                return Ok(Some(Frame {
                     cmd,
                     status: 0,
                     payload,
                     data_mode: DataMode::Len,
-                });
+                }));
             }
             [0x53, 0x00] => {
                 let mut len_bytes = [0u8; 2];
-                stream.read_exact(&mut len_bytes)?;
+                read_tunnel_exact_blocking(stream, &mut len_bytes)?;
                 let len = u16::from_be_bytes(len_bytes) as usize;
                 let mut payload = vec![0u8; len];
                 if len > 0 {
-                    stream.read_exact(&mut payload)?;
+                    read_tunnel_exact_blocking(stream, &mut payload)?;
                 }
                 continue;
             }
@@ -1575,12 +1652,12 @@ fn read_data_resp_payload(
     stream: &mut StreamOwned<ClientConnection, TcpStream>,
 ) -> AtrResult<(Vec<u8>, DataMode)> {
     let mut peek = [0u8; 2];
-    stream.read_exact(&mut peek)?;
+    read_tunnel_exact_blocking(stream, &mut peek)?;
     let payload_len = u16::from_be_bytes(peek) as usize;
     if payload_len > 0 && payload_len <= 4096 {
         let mut payload = vec![0u8; payload_len];
         if payload_len > 0 {
-            stream.read_exact(&mut payload)?;
+            read_tunnel_exact_blocking(stream, &mut payload)?;
         }
         return Ok((payload, DataMode::Len));
     }
@@ -1589,23 +1666,23 @@ fn read_data_resp_payload(
     let mut payload = vec![peek[0]];
     if token_len > 0 {
         let mut token = vec![0u8; token_len];
-        stream.read_exact(&mut token)?;
+        read_tunnel_exact_blocking(stream, &mut token)?;
         payload.extend_from_slice(&token);
     }
     let mut reserved = [0u8; 2];
-    stream.read_exact(&mut reserved)?;
+    read_tunnel_exact_blocking(stream, &mut reserved)?;
     payload.extend_from_slice(&reserved);
     let mut count = [0u8; 1];
-    stream.read_exact(&mut count)?;
+    read_tunnel_exact_blocking(stream, &mut count)?;
     payload.extend_from_slice(&count);
     for _ in 0..count[0] {
         let mut len_bytes = [0u8; 2];
-        stream.read_exact(&mut len_bytes)?;
+        read_tunnel_exact_blocking(stream, &mut len_bytes)?;
         payload.extend_from_slice(&len_bytes);
         let plen = u16::from_be_bytes(len_bytes) as usize;
         if plen > 0 {
             let mut pkt = vec![0u8; plen];
-            stream.read_exact(&mut pkt)?;
+            read_tunnel_exact_blocking(stream, &mut pkt)?;
             payload.extend_from_slice(&pkt);
         }
     }
@@ -1636,7 +1713,7 @@ fn build_auth_request(
         lang: lang_from_env(),
         ip: AuthIp {
             atype: auth_ip_type(meta.atype),
-            protocol: meta.protocol as i32,
+            protocol: protocol_number(meta.protocol),
             dest_addr: meta.dst_ip.to_string(),
             dest_port: meta.dst_port,
             src_addr: meta.src_ip.to_string(),
@@ -1729,15 +1806,17 @@ impl TrustEnv {
 }
 
 fn default_env() -> TrustEnv {
-    let proc_path = "/usr/bin/libreatrust";
+    // Match the reference client identity. The aTrust gateway evaluates these
+    // fields during L3 conntrack authorization.
+    let proc_path = "/usr/bin/zju-connect";
     let fingerprint = format!("{:X}", sha2::Sha256::digest(proc_path.as_bytes()));
     TrustEnv {
         application: TrustApp {
             runtime: TrustRuntime {
                 process: TrustProcess {
-                    name: "libreatrust".into(),
+                    name: "zju-connect".into(),
                     digital_signature: "TrustAppClosed".into(),
-                    platform: "Linux".into(),
+                    platform: current_platform_name().into(),
                     fingerprint,
                     description: "TrustAppClosed".into(),
                     path: proc_path.into(),
@@ -1747,6 +1826,15 @@ fn default_env() -> TrustEnv {
                 process_trusted: "TRUSTED".into(),
             },
         },
+    }
+}
+
+fn current_platform_name() -> &'static str {
+    match env::consts::OS {
+        "macos" => "macOS",
+        "windows" => "Windows",
+        "linux" => "Linux",
+        other => other,
     }
 }
 
@@ -1781,6 +1869,19 @@ fn build_data_payload(token: &str, packets: &[Vec<u8>]) -> Vec<u8> {
         payload.extend_from_slice(pkt);
     }
     payload
+}
+
+fn build_l3_auth_request_payload(req: &[u8]) -> AtrResult<Vec<u8>> {
+    if req.len() > u16::MAX as usize {
+        return Err(AtrError::InvalidArgument(
+            "l3 auth request too large".into(),
+        ));
+    }
+    let mut payload = Vec::with_capacity(4 + req.len());
+    payload.extend_from_slice(&[0x05, 0x13]);
+    payload.extend_from_slice(&(req.len() as u16).to_be_bytes());
+    payload.extend_from_slice(req);
+    Ok(payload)
 }
 
 fn parse_data_payload(payload: &[u8]) -> AtrResult<Vec<Vec<u8>>> {
@@ -2082,6 +2183,14 @@ fn proto_name(proto: ProtocolKind) -> &'static str {
     }
 }
 
+fn protocol_number(proto: ProtocolKind) -> i32 {
+    match proto {
+        ProtocolKind::Tcp => 6,
+        ProtocolKind::Udp => 17,
+        ProtocolKind::Icmp => 1,
+    }
+}
+
 fn auth_ip_type(atype: u8) -> i32 {
     match atype {
         6 => 0x86DD,
@@ -2117,8 +2226,8 @@ fn lang_from_env() -> String {
 
 fn conn_track_key(meta: &PacketMeta) -> String {
     format!(
-        "{}:{}-{}:{}",
-        meta.src_ip, meta.src_port, meta.dst_ip, meta.dst_port
+        "{}:{}:{}-{}:{}",
+        meta.atype, meta.src_ip, meta.src_port, meta.dst_ip, meta.dst_port
     )
 }
 
@@ -2133,6 +2242,93 @@ impl AtrClient {
 
     pub fn open_l3_tunnel(&self) -> AtrResult<L3Tunnel> {
         L3Tunnel::new(self.clone())
+    }
+
+    pub fn request_l3_virtual_ips(&self) -> AtrResult<Vec<Ipv4Addr>> {
+        let session = self
+            .session()
+            .ok_or_else(|| AtrError::InvalidState("session not set".into()))?;
+        let addr = self
+            .best_node()
+            .ok_or_else(|| AtrError::NotFound("no node for l3 virtual ip request".into()))?;
+        crate::diag_log(format!("[libreatrust][l3] virtual ip request node={addr}"));
+
+        let mut stream = connect_tls(&addr, self.client_config())?;
+        set_no_sigpipe(stream.sock.as_raw_fd());
+        stream.sock.set_read_timeout(Some(Duration::from_millis(
+            self.client_config().io_timeout_ms,
+        )))?;
+
+        let req = serde_json::to_vec(&json!({ "sid": session.sid }))?;
+        let packet = wrap_auth_req_data(&req, 1);
+        stream.write_all(&packet)?;
+        stream.flush()?;
+
+        let mut method = [0u8; 2];
+        stream.read_exact(&mut method)?;
+        if method != [0x05, 0xD0] {
+            return Err(AtrError::NetworkFailed(format!(
+                "unexpected virtual ip method {:?}",
+                method
+            )));
+        }
+
+        let mut header = [0u8; 4];
+        stream.read_exact(&mut header)?;
+        if header[0] != 0x53 {
+            return Err(AtrError::NetworkFailed(format!(
+                "unexpected virtual ip header {:02x?}",
+                header
+            )));
+        }
+        let status = header[1];
+        let len = u16::from_be_bytes([header[2], header[3]]) as usize;
+        let mut payload = vec![0u8; len];
+        if len > 0 {
+            stream.read_exact(&mut payload)?;
+        }
+        if status != 0 {
+            return Err(AtrError::Unauthorized(
+                String::from_utf8_lossy(&payload).into_owned(),
+            ));
+        }
+        if !payload.is_empty() {
+            let resp: AuthResponseSid = serde_json::from_slice(&payload)?;
+            if resp.code != 0 {
+                return Err(AtrError::Unauthorized(format!(
+                    "virtual ip request failed: {}",
+                    resp.message
+                )));
+            }
+        }
+
+        let mut vip_header = [0u8; 4];
+        stream.read_exact(&mut vip_header)?;
+        if vip_header[0] != 0x05 {
+            return Err(AtrError::NetworkFailed(format!(
+                "unexpected virtual ip payload header {:02x?}",
+                vip_header
+            )));
+        }
+        let data_len = vip_payload_length(vip_header[3]);
+        if data_len == 0 {
+            return Err(AtrError::NetworkFailed(
+                "virtual ip response had empty payload".into(),
+            ));
+        }
+        let mut vip_data = vec![0u8; data_len];
+        stream.read_exact(&mut vip_data)?;
+        let ips = parse_virtual_ip_bytes(&vip_data)
+            .filter(|ips| !ips.is_empty())
+            .ok_or_else(|| AtrError::ParseFailed("virtual ip response had no ipv4".into()))?;
+        crate::diag_log(format!(
+            "[libreatrust][l3] virtual ip ready {}",
+            ips.iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
+        Ok(ips)
     }
 }
 
