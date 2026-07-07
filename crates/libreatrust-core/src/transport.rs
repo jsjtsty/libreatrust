@@ -1081,10 +1081,6 @@ impl L3Tunnel {
             }
         };
 
-        crate::diag_log(format!(
-            "[libreatrust][l3] packet route dst={}:{} proto={:?} app={} node_group={}",
-            meta.dst_ip, meta.dst_port, meta.protocol, hit.app_id, hit.node_group_id
-        ));
         let remote = self.remote_for(&hit.node_group_id)?;
         remote.write_packet(meta, &hit.app_id, &hit.node_group_id, packet)?;
         Ok(packet.len())
@@ -1424,10 +1420,6 @@ impl L3Remote {
         let ct = self
             .conntracks
             .get_or_create(&conn_track_key(&meta), app_id, node_group_id);
-        crate::diag_log(format!(
-            "[libreatrust][l3] write begin key={} app={} node_group={}",
-            ct.key, app_id, node_group_id
-        ));
         self.ensure_auth(&ct, meta)?;
         let token = ct
             .connect_token
@@ -1437,15 +1429,12 @@ impl L3Remote {
             .ok_or_else(|| AtrError::InvalidState("missing connect token".into()))?;
         let payload = build_data_payload(&token, &[pkt.to_vec()]);
         self.write_interest.fetch_add(1, Ordering::SeqCst);
-        crate::diag_log(format!("[libreatrust][l3] data lock wait key={}", ct.key));
         let write_result = {
             let mut stream = self.stream.lock().unwrap();
-            crate::diag_log(format!("[libreatrust][l3] data lock acquired key={}", ct.key));
             stream.write_all(&payload).and_then(|_| stream.flush())
         };
         self.write_interest.fetch_sub(1, Ordering::SeqCst);
         write_result?;
-        crate::diag_log(format!("[libreatrust][l3] write ready key={}", ct.key));
         Ok(())
     }
 
@@ -1485,11 +1474,9 @@ impl L3Remote {
         let req = build_auth_request(&self.info, &self.sign_key, meta, ct)?;
         let packet = build_l3_auth_request_payload(&req)?;
         self.write_interest.fetch_add(1, Ordering::SeqCst);
-        crate::diag_log(format!("[libreatrust][l3] auth lock wait key={}", ct.key));
+        crate::diag_log(format!("[libreatrust][l3] auth request key={}", ct.key));
         let write_result = {
             let mut stream = self.stream.lock().unwrap();
-            crate::diag_log(format!("[libreatrust][l3] auth lock acquired key={}", ct.key));
-            crate::diag_log(format!("[libreatrust][l3] auth request key={}", ct.key));
             stream.write_all(&packet).and_then(|_| stream.flush())
         };
         self.write_interest.fetch_sub(1, Ordering::SeqCst);
