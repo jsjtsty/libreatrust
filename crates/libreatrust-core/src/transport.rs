@@ -1090,10 +1090,16 @@ impl L3Tunnel {
         if self.close_flag.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
-        for remote in self.remotes.lock().unwrap().values() {
-            remote.close_flag.store(true, Ordering::SeqCst);
+        let remotes: Vec<_> = self
+            .remotes
+            .lock()
+            .unwrap()
+            .drain()
+            .map(|(_, remote)| remote)
+            .collect();
+        for remote in remotes {
+            remote.close();
         }
-        self.remotes.lock().unwrap().clear();
         Ok(())
     }
 
@@ -1102,8 +1108,16 @@ impl L3Tunnel {
     }
 
     fn remote_for(&self, node_group_id: &str) -> AtrResult<Arc<L3Remote>> {
-        if let Some(existing) = self.remotes.lock().unwrap().get(node_group_id).cloned() {
-            return Ok(existing);
+        if self.close_flag.load(Ordering::SeqCst) {
+            return Err(AtrError::InvalidState("l3 tunnel closed".into()));
+        }
+        let existing = self.remotes.lock().unwrap().get(node_group_id).cloned();
+        if let Some(existing) = existing {
+            if !existing.close_flag.load(Ordering::SeqCst) {
+                return Ok(existing);
+            }
+            self.remotes.lock().unwrap().remove(node_group_id);
+            existing.close();
         }
         let node_addr = self
             .client
@@ -1211,6 +1225,8 @@ struct L3Remote {
     close_flag: Arc<AtomicBool>,
     write_interest: Arc<AtomicUsize>,
     vip_list: Arc<Mutex<Vec<Ipv4Addr>>>,
+    close_notify: Arc<(Mutex<bool>, Condvar)>,
+    workers: Mutex<Vec<thread::JoinHandle<()>>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1249,6 +1265,8 @@ impl L3Remote {
             close_flag: Arc::new(AtomicBool::new(false)),
             write_interest: Arc::new(AtomicUsize::new(0)),
             vip_list,
+            close_notify: Arc::new((Mutex::new(false), Condvar::new())),
+            workers: Mutex::new(Vec::new()),
         };
         remote.auth_tunnel()?;
         {
@@ -1270,59 +1288,103 @@ impl L3Remote {
         let heartbeat_close = self.close_flag.clone();
         let heartbeat_write_interest = self.write_interest.clone();
         let vip_list = self.vip_list.clone();
+        let close_notify = self.close_notify.clone();
+        let reader_notify = self.close_notify.clone();
 
-        thread::spawn(move || {
-            loop {
-                if close.load(Ordering::SeqCst) {
-                    break;
-                }
-                if write_interest.load(Ordering::SeqCst) > 0 {
-                    thread::sleep(Duration::from_millis(1));
-                    continue;
-                }
-                let frame = {
-                    let mut stream = reader.lock().unwrap();
-                    read_l3_frame_available(&mut *stream)
-                };
-                let frame = match frame {
-                    Ok(Some(v)) => v,
-                    Ok(None) => continue,
-                    Err(_) => break,
-                };
-                match frame.cmd {
-                    0x94 => {
-                        if frame.data_mode == DataMode::Len {
-                            let _ = incoming_tx.send(frame.payload);
-                        } else if let Ok(packets) = parse_data_payload(&frame.payload) {
-                            for pkt in packets {
-                                let _ = incoming_tx.send(pkt);
+        let reader_stream = reader.clone();
+        let reader_close = close.clone();
+        let reader_worker = thread::Builder::new()
+            .name("libreatrust-l3-reader".into())
+            .spawn(move || {
+                loop {
+                    if close.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    if write_interest.load(Ordering::SeqCst) > 0 {
+                        thread::sleep(Duration::from_millis(1));
+                        continue;
+                    }
+                    let frame = {
+                        let mut stream = reader.lock().unwrap();
+                        read_l3_frame_available(&mut *stream)
+                    };
+                    let frame = match frame {
+                        Ok(Some(v)) => v,
+                        Ok(None) => continue,
+                        Err(_) => break,
+                    };
+                    match frame.cmd {
+                        0x94 => {
+                            if frame.data_mode == DataMode::Len {
+                                let _ = incoming_tx.send(frame.payload);
+                            } else if let Ok(packets) = parse_data_payload(&frame.payload) {
+                                for pkt in packets {
+                                    let _ = incoming_tx.send(pkt);
+                                }
                             }
                         }
-                    }
-                    0x93 => {
-                        let _ = handle_auth_resp(&conntracks, frame.status, &frame.payload);
-                    }
-                    0x95 => {}
-                    0x96 => {
-                        if let Some(ips) = parse_virtual_ip_bytes(&frame.payload) {
-                            *vip_list.lock().unwrap() = ips;
+                        0x93 => {
+                            let _ = handle_auth_resp(&conntracks, frame.status, &frame.payload);
                         }
+                        0x95 => {}
+                        0x96 => {
+                            if let Some(ips) = parse_virtual_ip_bytes(&frame.payload) {
+                                *vip_list.lock().unwrap() = ips;
+                            }
+                        }
+                        _ => {}
                     }
-                    _ => {}
                 }
-            }
-        });
+                reader_close.store(true, Ordering::SeqCst);
+                let (closed, notify) = &*reader_notify;
+                *closed.lock().unwrap() = true;
+                notify.notify_all();
+                if let Ok(stream) = reader_stream.lock() {
+                    let _ = stream.sock.shutdown(Shutdown::Both);
+                }
+            })
+            .expect("failed to spawn L3 reader");
 
-        thread::spawn(move || {
-            while !heartbeat_close.load(Ordering::SeqCst) {
-                thread::sleep(Duration::from_secs(25));
-                heartbeat_write_interest.fetch_add(1, Ordering::SeqCst);
-                let mut stream = heartbeat_stream.lock().unwrap();
-                let _ = stream.write_all(&[0x05, 0x15, 0x00, 0x00]);
-                let _ = stream.flush();
-                heartbeat_write_interest.fetch_sub(1, Ordering::SeqCst);
-            }
-        });
+        let heartbeat_worker = thread::Builder::new()
+            .name("libreatrust-l3-heartbeat".into())
+            .spawn(move || {
+                while !heartbeat_close.load(Ordering::SeqCst) {
+                    let (closed, notify) = &*close_notify;
+                    let guard = closed.lock().unwrap();
+                    if *guard {
+                        break;
+                    }
+                    let (guard, _) = notify.wait_timeout(guard, Duration::from_secs(25)).unwrap();
+                    if *guard || heartbeat_close.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    heartbeat_write_interest.fetch_add(1, Ordering::SeqCst);
+                    let mut stream = heartbeat_stream.lock().unwrap();
+                    let _ = stream.write_all(&[0x05, 0x15, 0x00, 0x00]);
+                    let _ = stream.flush();
+                    heartbeat_write_interest.fetch_sub(1, Ordering::SeqCst);
+                }
+            })
+            .expect("failed to spawn L3 heartbeat");
+
+        self.workers
+            .lock()
+            .unwrap()
+            .extend([reader_worker, heartbeat_worker]);
+    }
+
+    fn close(&self) {
+        self.close_flag.store(true, Ordering::SeqCst);
+        let (closed, notify) = &*self.close_notify;
+        *closed.lock().unwrap() = true;
+        notify.notify_all();
+        if let Ok(stream) = self.stream.lock() {
+            let _ = stream.sock.shutdown(Shutdown::Both);
+        }
+        let workers = std::mem::take(&mut *self.workers.lock().unwrap());
+        for worker in workers {
+            let _ = worker.join();
+        }
     }
 
     fn auth_tunnel(&self) -> AtrResult<()> {

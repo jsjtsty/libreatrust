@@ -2,6 +2,7 @@ use crate::client::AtrClient;
 use crate::error::{AtrError, AtrResult};
 use crate::transport::{TcpTunnel, connect_tcp_bound};
 use crate::types::RouteDecision;
+use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -50,6 +51,8 @@ pub struct ProxyService {
     last_error: Arc<Mutex<Option<String>>>,
     last_event: Arc<Mutex<Option<ProxyServiceEvent>>>,
     worker: Mutex<Option<thread::JoinHandle<()>>>,
+    connections: Arc<Mutex<Vec<thread::JoinHandle<()>>>>,
+    active_sockets: Arc<Mutex<HashMap<u64, TcpStream>>>,
 }
 
 impl ProxyService {
@@ -68,12 +71,16 @@ impl ProxyService {
         let total_connections = Arc::new(AtomicU64::new(0));
         let last_error = Arc::new(Mutex::new(None));
         let last_event = Arc::new(Mutex::new(None));
+        let connections = Arc::new(Mutex::new(Vec::new()));
+        let active_sockets = Arc::new(Mutex::new(HashMap::new()));
 
         let worker_stop = stop.clone();
         let worker_active = active_connections.clone();
         let worker_total = total_connections.clone();
         let worker_error = last_error.clone();
         let worker_event = last_event.clone();
+        let worker_connections = connections.clone();
+        let worker_sockets = active_sockets.clone();
         let worker = thread::Builder::new()
             .name("libreatrust-proxy-listener".into())
             .spawn(move || {
@@ -86,6 +93,8 @@ impl ProxyService {
                     worker_total,
                     worker_error,
                     worker_event,
+                    worker_connections,
+                    worker_sockets,
                 )
             })
             .map_err(|err| AtrError::Internal(format!("failed to start proxy listener: {err}")))?;
@@ -98,14 +107,23 @@ impl ProxyService {
             last_error,
             last_event,
             worker: Mutex::new(Some(worker)),
+            connections,
+            active_sockets,
         })
     }
 
     pub fn stop(&self) -> AtrResult<()> {
         self.stop.store(true, Ordering::SeqCst);
+        for stream in self.active_sockets.lock().unwrap().values() {
+            let _ = stream.shutdown(Shutdown::Both);
+        }
         let _ = TcpStream::connect_timeout(&self.endpoint, Duration::from_millis(100));
         if let Some(worker) = self.worker.lock().unwrap().take() {
             let _ = worker.join();
+        }
+        let connections = std::mem::take(&mut *self.connections.lock().unwrap());
+        for connection in connections {
+            let _ = connection.join();
         }
         Ok(())
     }
@@ -165,6 +183,8 @@ fn run_listener(
     total_connections: Arc<AtomicU64>,
     last_error: Arc<Mutex<Option<String>>>,
     last_event: Arc<Mutex<Option<ProxyServiceEvent>>>,
+    connections: Arc<Mutex<Vec<thread::JoinHandle<()>>>>,
+    active_sockets: Arc<Mutex<HashMap<u64, TcpStream>>>,
 ) {
     while !stop.load(Ordering::SeqCst) {
         match listener.accept() {
@@ -175,12 +195,16 @@ fn run_listener(
                 let client = client.clone();
                 let config = config.clone();
                 let active = active_connections.clone();
-                let total = total_connections.clone();
                 let error_slot = last_error.clone();
                 let event_slot = last_event.clone();
+                let socket_map = active_sockets.clone();
+                let connection_id = total_connections.fetch_add(1, Ordering::Relaxed) + 1;
+                if let Ok(socket) = stream.try_clone() {
+                    active_sockets.lock().unwrap().insert(connection_id, socket);
+                }
                 active.fetch_add(1, Ordering::Relaxed);
-                total.fetch_add(1, Ordering::Relaxed);
-                let _ = thread::Builder::new()
+                let worker_active = active.clone();
+                let connection = thread::Builder::new()
                     .name("libreatrust-proxy-conn".into())
                     .spawn(move || {
                         if let Err(err) = handle_connection(stream, client, config) {
@@ -189,8 +213,15 @@ fn run_listener(
                             ));
                             record_proxy_error(&error_slot, &event_slot, err);
                         }
-                        active.fetch_sub(1, Ordering::Relaxed);
+                        socket_map.lock().unwrap().remove(&connection_id);
+                        worker_active.fetch_sub(1, Ordering::Relaxed);
                     });
+                if let Ok(connection) = connection {
+                    connections.lock().unwrap().push(connection);
+                } else {
+                    active_sockets.lock().unwrap().remove(&connection_id);
+                    active.fetch_sub(1, Ordering::Relaxed);
+                }
             }
             Err(err) if err.kind() == ErrorKind::Interrupted => {}
             Err(err) => {
