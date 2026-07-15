@@ -63,12 +63,21 @@ impl Default for AuthConfig {
             server_port: 443,
             user_agent: String::from("Mozilla/5.0"),
             client_type: String::from("SDPClient"),
-            platform: String::from("Linux"),
+            platform: default_platform_name().into(),
             login_domain: String::new(),
             preferred_auth_type: None,
             io_timeout_ms: 20_000,
             allow_insecure_tls: true,
         }
+    }
+}
+
+fn default_platform_name() -> &'static str {
+    match std::env::consts::OS {
+        "macos" => "macOS",
+        "windows" => "Windows",
+        "linux" => "Linux",
+        other => other,
     }
 }
 

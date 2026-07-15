@@ -22,6 +22,7 @@ hex = "0.4"
 hmac = "0.12"
 ipnet = "2"
 libc = "0.2"
+mio = { version = "1", features = ["net", "os-poll"] }
 md5 = "0.7"
 rand = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "cookies", "json", "rustls-tls"] }

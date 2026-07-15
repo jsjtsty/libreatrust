@@ -11,12 +11,13 @@ use serde_json::json;
 use sha2::Digest;
 use std::collections::{HashMap, VecDeque};
 use std::env;
+#[cfg(target_family = "unix")]
 use std::ffi::CStr;
 use std::fmt;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
-use std::os::fd::{AsRawFd, FromRawFd};
-use std::os::unix::net::UnixStream;
+#[cfg(target_family = "unix")]
+use std::os::fd::FromRawFd;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
 use std::thread;
@@ -26,7 +27,7 @@ use std::time::{Duration, SystemTime};
 pub struct TcpTunnel {
     incoming_rx: Mutex<mpsc::Receiver<AtrResult<Vec<u8>>>>,
     write_tx: mpsc::Sender<TcpTunnelCommand>,
-    wake_tx: Mutex<UnixStream>,
+    wake_tx: Mutex<TcpStream>,
     read_buf: Mutex<VecDeque<u8>>,
     closed: AtomicBool,
 }
@@ -69,7 +70,6 @@ impl TcpTunnel {
             .session()
             .ok_or_else(|| AtrError::InvalidState("session not set".into()))?;
         let mut stream = connect_tls(&node_addr, client.client_config())?;
-        set_no_sigpipe(stream.sock.as_raw_fd());
         stream.sock.set_read_timeout(Some(Duration::from_millis(
             client.client_config().io_timeout_ms,
         )))?;
@@ -83,9 +83,7 @@ impl TcpTunnel {
 
         let (incoming_tx, incoming_rx) = mpsc::channel();
         let (write_tx, write_rx) = mpsc::channel();
-        let (wake_rx, wake_tx) = UnixStream::pair()?;
-        set_no_sigpipe(wake_rx.as_raw_fd());
-        set_no_sigpipe(wake_tx.as_raw_fd());
+        let (wake_rx, wake_tx) = tcp_stream_pair()?;
         wake_rx.set_nonblocking(true)?;
         wake_tx.set_nonblocking(true)?;
         thread::spawn(move || run_tcp_tunnel_worker(stream, incoming_tx, write_rx, wake_rx));
@@ -166,14 +164,14 @@ fn run_tcp_tunnel_worker(
     mut stream: StreamOwned<ClientConnection, TcpStream>,
     incoming_tx: mpsc::Sender<AtrResult<Vec<u8>>>,
     write_rx: mpsc::Receiver<TcpTunnelCommand>,
-    mut wake_rx: UnixStream,
+    mut wake_rx: TcpStream,
 ) {
     loop {
         if !drain_tcp_tunnel_commands(&mut stream, &write_rx) {
             return;
         }
 
-        let event = match wait_for_tcp_tunnel_event(stream.sock.as_raw_fd(), wake_rx.as_raw_fd()) {
+        let event = match wait_for_tcp_tunnel_event(&stream.sock, &wake_rx) {
             Ok(event) => event,
             Err(error) => {
                 let _ = incoming_tx.send(Err(error));
@@ -258,43 +256,27 @@ struct TcpTunnelEvent {
     wake_readable: bool,
 }
 
-fn wait_for_tcp_tunnel_event(socket_fd: i32, wake_fd: i32) -> AtrResult<TcpTunnelEvent> {
-    let mut poll_fds = [
-        libc::pollfd {
-            fd: socket_fd,
-            events: libc::POLLIN,
-            revents: 0,
-        },
-        libc::pollfd {
-            fd: wake_fd,
-            events: libc::POLLIN,
-            revents: 0,
-        },
-    ];
+fn wait_for_tcp_tunnel_event(socket: &TcpStream, wake: &TcpStream) -> AtrResult<TcpTunnelEvent> {
+    use mio::event::Event;
+    use mio::net::TcpStream as MioTcpStream;
+    use mio::{Events, Interest, Poll, Token};
 
-    loop {
-        let result = unsafe { libc::poll(poll_fds.as_mut_ptr(), poll_fds.len() as _, -1) };
-        if result > 0 {
-            return Ok(TcpTunnelEvent {
-                socket_readable: poll_fds[0].revents
-                    & (libc::POLLIN | libc::POLLHUP | libc::POLLERR)
-                    != 0,
-                wake_readable: poll_fds[1].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR)
-                    != 0,
-            });
-        }
-        if result == 0 {
-            continue;
-        }
-        let err = std::io::Error::last_os_error();
-        if err.kind() == ErrorKind::Interrupted {
-            continue;
-        }
-        return Err(AtrError::from(err));
-    }
+    let mut socket = MioTcpStream::from_std(socket.try_clone()?);
+    let mut wake = MioTcpStream::from_std(wake.try_clone()?);
+    let mut poll = Poll::new().map_err(AtrError::from)?;
+    poll.registry()
+        .register(&mut socket, Token(0), Interest::READABLE)?;
+    poll.registry()
+        .register(&mut wake, Token(1), Interest::READABLE)?;
+    let mut events = Events::with_capacity(2);
+    poll.poll(&mut events, None).map_err(AtrError::from)?;
+    Ok(TcpTunnelEvent {
+        socket_readable: events.iter().any(|event: &Event| event.token() == Token(0)),
+        wake_readable: events.iter().any(|event: &Event| event.token() == Token(1)),
+    })
 }
 
-fn drain_wake_stream(wake_rx: &mut UnixStream) {
+fn drain_wake_stream(wake_rx: &mut TcpStream) {
     let mut buf = [0u8; 64];
     loop {
         match wake_rx.read(&mut buf) {
@@ -308,6 +290,17 @@ fn drain_wake_stream(wake_rx: &mut UnixStream) {
     }
 }
 
+fn tcp_stream_pair() -> AtrResult<(TcpStream, TcpStream)> {
+    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
+    let address = listener.local_addr()?;
+    let sender = TcpStream::connect(address)?;
+    let (receiver, _) = listener.accept()?;
+    receiver.set_nonblocking(true)?;
+    sender.set_nonblocking(true)?;
+    Ok((receiver, sender))
+}
+
+#[cfg(target_family = "unix")]
 fn set_no_sigpipe(fd: i32) {
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     unsafe {
@@ -322,6 +315,7 @@ fn set_no_sigpipe(fd: i32) {
     }
 }
 
+#[cfg(target_family = "unix")]
 pub(crate) fn connect_tcp_bound(addr: &SocketAddr, timeout: Duration) -> AtrResult<TcpStream> {
     let fd = unsafe { libc::socket(socket_domain(addr), libc::SOCK_STREAM, 0) };
     if fd < 0 {
@@ -380,6 +374,14 @@ pub(crate) fn connect_tcp_bound(addr: &SocketAddr, timeout: Duration) -> AtrResu
     Ok(stream)
 }
 
+#[cfg(target_os = "windows")]
+pub(crate) fn connect_tcp_bound(addr: &SocketAddr, timeout: Duration) -> AtrResult<TcpStream> {
+    // Windows has no portable equivalent of the Unix interface-binding code below.
+    // The OS routing table still selects the appropriate active interface.
+    Ok(TcpStream::connect_timeout(addr, timeout)?)
+}
+
+#[cfg(target_family = "unix")]
 fn socket_domain(addr: &SocketAddr) -> libc::c_int {
     match addr {
         SocketAddr::V4(_) => libc::AF_INET,
@@ -387,8 +389,10 @@ fn socket_domain(addr: &SocketAddr) -> libc::c_int {
     }
 }
 
+#[cfg(target_family = "unix")]
 static PHYSICAL_INTERFACE_INDEX: OnceLock<u32> = OnceLock::new();
 
+#[cfg(target_family = "unix")]
 fn set_bound_interface(fd: libc::c_int, addr: &SocketAddr) -> AtrResult<()> {
     let Some(interface_index) = default_physical_interface_index(addr) else {
         crate::diag_log(
@@ -419,6 +423,7 @@ fn set_bound_interface(fd: libc::c_int, addr: &SocketAddr) -> AtrResult<()> {
     Ok(())
 }
 
+#[cfg(target_family = "unix")]
 fn default_physical_interface_index(addr: &SocketAddr) -> Option<u32> {
     if let Some(index) = PHYSICAL_INTERFACE_INDEX.get().copied() {
         return Some(index);
@@ -430,6 +435,7 @@ fn default_physical_interface_index(addr: &SocketAddr) -> Option<u32> {
     index
 }
 
+#[cfg(target_family = "unix")]
 fn route_default_physical_interface(addr: &SocketAddr) -> Option<u32> {
     let family_flag = match addr {
         SocketAddr::V4(_) => "-inet",
@@ -452,6 +458,7 @@ fn route_default_physical_interface(addr: &SocketAddr) -> Option<u32> {
     if index == 0 { None } else { Some(index) }
 }
 
+#[cfg(target_family = "unix")]
 fn active_physical_interface(addr: &SocketAddr) -> Option<u32> {
     let family = match addr {
         SocketAddr::V4(_) => libc::AF_INET,
@@ -504,6 +511,7 @@ fn active_physical_interface(addr: &SocketAddr) -> Option<u32> {
     })
 }
 
+#[cfg(target_family = "unix")]
 fn interface_flags_are_usable(flags: libc::c_uint) -> bool {
     flags & (libc::IFF_UP as libc::c_uint) != 0
         && flags & (libc::IFF_RUNNING as libc::c_uint) != 0
@@ -511,6 +519,7 @@ fn interface_flags_are_usable(flags: libc::c_uint) -> bool {
         && flags & (libc::IFF_POINTOPOINT as libc::c_uint) == 0
 }
 
+#[cfg(target_family = "unix")]
 fn is_physical_interface_name(name: &str) -> bool {
     !(name.starts_with("utun")
         || name.starts_with("lo")
@@ -523,6 +532,7 @@ fn is_physical_interface_name(name: &str) -> bool {
         || name.starts_with("vmenet"))
 }
 
+#[cfg(target_family = "unix")]
 fn physical_interface_score(name: &str) -> i32 {
     if name.starts_with("en") {
         100
@@ -533,6 +543,7 @@ fn physical_interface_score(name: &str) -> i32 {
     }
 }
 
+#[cfg(target_family = "unix")]
 fn route_field(text: &str, name: &str) -> Option<String> {
     text.lines().find_map(|line| {
         let (key, value) = line.split_once(':')?;
@@ -544,6 +555,7 @@ fn route_field(text: &str, name: &str) -> Option<String> {
     })
 }
 
+#[cfg(target_family = "unix")]
 fn set_nonblocking(fd: libc::c_int, enabled: bool) -> AtrResult<()> {
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
     if flags < 0 {
@@ -560,6 +572,7 @@ fn set_nonblocking(fd: libc::c_int, enabled: bool) -> AtrResult<()> {
     Ok(())
 }
 
+#[cfg(target_family = "unix")]
 fn wait_for_connect(fd: libc::c_int, timeout: Duration) -> AtrResult<()> {
     let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as libc::c_int;
     let mut poll_fd = libc::pollfd {
@@ -602,6 +615,7 @@ fn wait_for_connect(fd: libc::c_int, timeout: Duration) -> AtrResult<()> {
     Ok(())
 }
 
+#[cfg(target_family = "unix")]
 fn sockaddr_storage(addr: &SocketAddr) -> (libc::sockaddr_storage, usize) {
     match addr {
         SocketAddr::V4(v4) => {
@@ -647,15 +661,22 @@ fn send_tcp_init(
     dest_addr: &str,
     port: u16,
 ) -> AtrResult<()> {
-    let proc_path = if port == 22 {
+    let proc_path = if cfg!(target_os = "windows") {
+        if port == 22 {
+            "ssh.exe"
+        } else {
+            "libreatrust.exe"
+        }
+    } else if port == 22 {
         "/usr/bin/ssh"
     } else {
         "/usr/bin/libreatrust"
     };
     let proc_name = if port == 22 { "ssh" } else { "libreatrust" };
+    let platform = current_platform_name();
     let proc_hash = format!("{:X}", sha2::Sha256::digest(proc_path.as_bytes()));
     let msg = format!(
-        r#"{{"sid":"{}","appId":"{}","url":"tcp://{}:{}","deviceId":"{}","connectionId":"{}","procHash":"{}","userName":"{}","rcAppliedInfo":0,"lang":"en-US","destAddr":"{}:{}","env":{{"application":{{"runtime":{{"process":{{"name":"{}","digital_signature":"TrustAppClosed","platform":"Linux","fingerprint":"{}","description":"TrustAppClosed","path":"{}","version":"TrustAppClosed","security_env":"normal"}},"process_trusted":"TRUSTED"}}}}}},"xRequestSig":""}}"#,
+        r#"{{"sid":"{}","appId":"{}","url":"tcp://{}:{}","deviceId":"{}","connectionId":"{}","procHash":"{}","userName":"{}","rcAppliedInfo":0,"lang":"en-US","destAddr":"{}:{}","env":{{"application":{{"runtime":{{"process":{{"name":"{}","digital_signature":"TrustAppClosed","platform":"{}","fingerprint":"{}","description":"TrustAppClosed","path":"{}","version":"TrustAppClosed","security_env":"normal"}},"process_trusted":"TRUSTED"}}}}}},"xRequestSig":""}}"#,
         session.sid,
         app_id,
         dest_addr,
@@ -667,6 +688,7 @@ fn send_tcp_init(
         dest_addr,
         port,
         proc_name,
+        platform,
         proc_hash,
         proc_path
     );
@@ -1248,7 +1270,6 @@ impl L3Remote {
         vip_list: Arc<Mutex<Vec<Ipv4Addr>>>,
     ) -> AtrResult<Self> {
         let stream = connect_tls(&addr, client.client_config())?;
-        set_no_sigpipe(stream.sock.as_raw_fd());
         stream.sock.set_read_timeout(Some(Duration::from_millis(
             client.client_config().io_timeout_ms,
         )))?;
@@ -2303,7 +2324,6 @@ impl AtrClient {
         crate::diag_log(format!("[libreatrust][l3] virtual ip request node={addr}"));
 
         let mut stream = connect_tls(&addr, self.client_config())?;
-        set_no_sigpipe(stream.sock.as_raw_fd());
         stream.sock.set_read_timeout(Some(Duration::from_millis(
             self.client_config().io_timeout_ms,
         )))?;
