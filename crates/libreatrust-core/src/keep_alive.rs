@@ -5,7 +5,7 @@ use rustls::pki_types::ServerName;
 use rustls::{ClientConnection, StreamOwned};
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 use url::Url;
@@ -39,6 +39,7 @@ pub struct KeepAliveService {
     stop: Arc<AtomicBool>,
     probe_count: Arc<AtomicU64>,
     last_error: Arc<Mutex<Option<String>>>,
+    wake: Arc<(Mutex<()>, Condvar)>,
     worker: Mutex<Option<thread::JoinHandle<()>>>,
 }
 
@@ -48,10 +49,12 @@ impl KeepAliveService {
         let stop = Arc::new(AtomicBool::new(false));
         let probe_count = Arc::new(AtomicU64::new(0));
         let last_error = Arc::new(Mutex::new(None));
+        let wake = Arc::new((Mutex::new(()), Condvar::new()));
 
         let worker_stop = stop.clone();
         let worker_count = probe_count.clone();
         let worker_error = last_error.clone();
+        let worker_wake = wake.clone();
         let worker = thread::Builder::new()
             .name("libreatrust-keep-alive".into())
             .spawn(move || {
@@ -72,12 +75,13 @@ impl KeepAliveService {
                         crate::diag_log("[libreatrust][keep-alive] probe succeeded");
                     }
 
-                    let mut remaining = interval;
-                    while remaining > Duration::ZERO && !worker_stop.load(Ordering::SeqCst) {
-                        let slice = remaining.min(Duration::from_millis(250));
-                        thread::sleep(slice);
-                        remaining = remaining.saturating_sub(slice);
-                    }
+                    let (lock, wake) = &*worker_wake;
+                    let guard = lock.lock().unwrap();
+                    let _ = wake
+                        .wait_timeout_while(guard, interval, |_| {
+                            !worker_stop.load(Ordering::SeqCst)
+                        })
+                        .unwrap();
                 }
             })
             .map_err(|err| AtrError::Internal(format!("failed to start keep-alive: {err}")))?;
@@ -86,12 +90,14 @@ impl KeepAliveService {
             stop,
             probe_count,
             last_error,
+            wake,
             worker: Mutex::new(Some(worker)),
         })
     }
 
     pub fn stop(&self) {
         self.stop.store(true, Ordering::SeqCst);
+        self.wake.1.notify_all();
         if let Some(worker) = self.worker.lock().unwrap().take() {
             let _ = worker.join();
         }
@@ -108,6 +114,7 @@ impl KeepAliveService {
 impl Drop for KeepAliveService {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
+        self.wake.1.notify_all();
         if let Some(worker) = self.worker.get_mut().unwrap().take() {
             let _ = worker.join();
         }
