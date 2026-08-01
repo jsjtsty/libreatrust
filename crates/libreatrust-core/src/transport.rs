@@ -19,7 +19,7 @@ use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
 #[cfg(target_family = "unix")]
 use std::os::fd::FromRawFd;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, SystemTime};
 
@@ -74,8 +74,8 @@ impl TcpTunnel {
             client.client_config().io_timeout_ms,
         )))?;
         send_tcp_init(&mut stream, session, &hit.app_id, host, port)?;
-        validate_tcp_tunnel_auth(&mut stream)?;
         send_tcp_dest(&mut stream, host, port)?;
+        wait_for_tcp_connect_status(&mut stream)?;
         stream.sock.set_read_timeout(None)?;
         crate::diag_log(format!(
             "[libreatrust][tcp] connect ready target={host}:{port}"
@@ -315,14 +315,47 @@ fn set_no_sigpipe(fd: i32) {
     }
 }
 
+pub(crate) fn connect_tcp_bound(
+    addr: &SocketAddr,
+    timeout: Duration,
+    config: &crate::types::ClientConfig,
+) -> AtrResult<TcpStream> {
+    let manual_index = config
+        .bind_interface
+        .as_deref()
+        .map(interface_index_by_name)
+        .transpose()?
+        .flatten();
+    let auto_detect = manual_index.is_none() && config.auto_detect_interface;
+    let selected_index =
+        manual_index.or_else(|| auto_detect.then(|| default_interface_index(addr)).flatten());
+    let result = connect_tcp_bound_once(addr, timeout, selected_index);
+    if result.is_ok() || !auto_detect {
+        return result;
+    }
+    let refreshed_index = default_interface_index(addr);
+    if refreshed_index == selected_index {
+        return result;
+    }
+    crate::diag_log(format!(
+        "[libreatrust][transport] retrying outbound connection after interface refresh: {:?} -> {:?}",
+        selected_index, refreshed_index
+    ));
+    connect_tcp_bound_once(addr, timeout, refreshed_index)
+}
+
 #[cfg(target_family = "unix")]
-pub(crate) fn connect_tcp_bound(addr: &SocketAddr, timeout: Duration) -> AtrResult<TcpStream> {
+fn connect_tcp_bound_once(
+    addr: &SocketAddr,
+    timeout: Duration,
+    interface_index: Option<u32>,
+) -> AtrResult<TcpStream> {
     let fd = unsafe { libc::socket(socket_domain(addr), libc::SOCK_STREAM, 0) };
     if fd < 0 {
         return Err(AtrError::from(std::io::Error::last_os_error()));
     }
 
-    if let Err(err) = set_bound_interface(fd, addr) {
+    if let Err(err) = set_bound_interface(fd, addr, interface_index) {
         unsafe {
             libc::close(fd);
         }
@@ -375,10 +408,61 @@ pub(crate) fn connect_tcp_bound(addr: &SocketAddr, timeout: Duration) -> AtrResu
 }
 
 #[cfg(target_os = "windows")]
-pub(crate) fn connect_tcp_bound(addr: &SocketAddr, timeout: Duration) -> AtrResult<TcpStream> {
-    // Windows has no portable equivalent of the Unix interface-binding code below.
-    // The OS routing table still selects the appropriate active interface.
-    Ok(TcpStream::connect_timeout(addr, timeout)?)
+fn connect_tcp_bound_once(
+    addr: &SocketAddr,
+    timeout: Duration,
+    interface_index: Option<u32>,
+) -> AtrResult<TcpStream> {
+    use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+
+    let socket = Socket::new(
+        Domain::for_address(*addr),
+        Type::STREAM,
+        Some(Protocol::TCP),
+    )?;
+    if let Some(index) = interface_index {
+        set_windows_bound_interface(&socket, addr, index)?;
+    }
+    socket.connect_timeout(&SockAddr::from(*addr), timeout)?;
+    Ok(socket.into())
+}
+
+#[cfg(target_os = "windows")]
+fn set_windows_bound_interface(
+    socket: &socket2::Socket,
+    addr: &SocketAddr,
+    interface_index: u32,
+) -> AtrResult<()> {
+    use std::os::windows::io::AsRawSocket;
+
+    // Windows expects the IPv4 interface index in network byte order while
+    // the IPv6 option uses the native integer representation.
+    let value = if addr.is_ipv4() {
+        interface_index.to_be()
+    } else {
+        interface_index
+    };
+    let (level, option) = if addr.is_ipv4() {
+        (0, 31) // IPPROTO_IP / IP_UNICAST_IF
+    } else {
+        (41, 31) // IPPROTO_IPV6 / IPV6_UNICAST_IF
+    };
+    let result = unsafe {
+        libc::setsockopt(
+            socket.as_raw_socket(),
+            level,
+            option,
+            &value as *const _ as *const libc::c_char,
+            std::mem::size_of_val(&value) as libc::c_int,
+        )
+    };
+    if result != 0 {
+        return Err(AtrError::from(std::io::Error::last_os_error()));
+    }
+    crate::diag_log(format!(
+        "[libreatrust][transport] bound Windows socket to if_index={interface_index}"
+    ));
+    Ok(())
 }
 
 #[cfg(target_family = "unix")]
@@ -390,11 +474,12 @@ fn socket_domain(addr: &SocketAddr) -> libc::c_int {
 }
 
 #[cfg(target_family = "unix")]
-static PHYSICAL_INTERFACE_INDEX: OnceLock<u32> = OnceLock::new();
-
-#[cfg(target_family = "unix")]
-fn set_bound_interface(fd: libc::c_int, addr: &SocketAddr) -> AtrResult<()> {
-    let Some(interface_index) = default_physical_interface_index(addr) else {
+fn set_bound_interface(
+    fd: libc::c_int,
+    addr: &SocketAddr,
+    interface_index: Option<u32>,
+) -> AtrResult<()> {
+    let Some(interface_index) = interface_index else {
         crate::diag_log(
             "[libreatrust][transport] no physical interface available for bound socket",
         );
@@ -425,14 +510,107 @@ fn set_bound_interface(fd: libc::c_int, addr: &SocketAddr) -> AtrResult<()> {
 
 #[cfg(target_family = "unix")]
 fn default_physical_interface_index(addr: &SocketAddr) -> Option<u32> {
-    if let Some(index) = PHYSICAL_INTERFACE_INDEX.get().copied() {
-        return Some(index);
+    route_default_physical_interface(addr).or_else(|| active_physical_interface(addr))
+}
+
+#[cfg(target_family = "unix")]
+fn default_interface_index(addr: &SocketAddr) -> Option<u32> {
+    default_physical_interface_index(addr)
+}
+
+#[cfg(target_family = "unix")]
+fn interface_index_by_name(name: &str) -> AtrResult<Option<u32>> {
+    let name = std::ffi::CString::new(name)
+        .map_err(|_| AtrError::InvalidArgument("bind_interface contains NUL".into()))?;
+    let index = unsafe { libc::if_nametoindex(name.as_ptr()) };
+    if index == 0 {
+        return Err(AtrError::InvalidArgument(format!(
+            "network interface not found: {name:?}"
+        )));
     }
-    let index = route_default_physical_interface(addr).or_else(|| active_physical_interface(addr));
-    if let Some(index) = index {
-        let _ = PHYSICAL_INTERFACE_INDEX.set(index);
+    Ok(Some(index))
+}
+
+#[cfg(target_os = "windows")]
+fn windows_adapters() -> AtrResult<Vec<(String, u32, u32)>> {
+    use windows_sys::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, ERROR_SUCCESS};
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        GetAdaptersAddresses, IF_TYPE_ETHERNET_CSMACD, IF_TYPE_IEEE80211, IP_ADAPTER_ADDRESSES_LH,
+    };
+    use windows_sys::Win32::NetworkManagement::Ndis::IfOperStatusUp;
+    use windows_sys::Win32::Networking::WinSock::AF_UNSPEC;
+
+    let mut size = 0u32;
+    let result = unsafe {
+        GetAdaptersAddresses(
+            AF_UNSPEC as u32,
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut size,
+        )
+    };
+    if result != ERROR_BUFFER_OVERFLOW {
+        return Err(AtrError::NetworkFailed(format!(
+            "GetAdaptersAddresses failed: {result}"
+        )));
     }
-    index
+    let mut buffer = vec![0u8; size as usize];
+    let head = buffer.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES_LH;
+    let result =
+        unsafe { GetAdaptersAddresses(AF_UNSPEC as u32, 0, std::ptr::null_mut(), head, &mut size) };
+    if result != ERROR_SUCCESS {
+        return Err(AtrError::NetworkFailed(format!(
+            "GetAdaptersAddresses failed: {result}"
+        )));
+    }
+
+    let mut adapters = Vec::new();
+    let mut current = head;
+    while !current.is_null() {
+        let adapter = unsafe { &*current };
+        let if_index = unsafe { adapter.Anonymous1.Anonymous.IfIndex };
+        if adapter.OperStatus == IfOperStatusUp && if_index != 0 {
+            let name = unsafe {
+                let mut length = 0usize;
+                while !adapter.FriendlyName.0.add(length).read().eq(&0) {
+                    length += 1;
+                }
+                String::from_utf16_lossy(std::slice::from_raw_parts(adapter.FriendlyName.0, length))
+            };
+            adapters.push((name, if_index, adapter.IfType));
+        }
+        current = adapter.Next;
+    }
+    Ok(adapters)
+}
+
+#[cfg(target_os = "windows")]
+fn interface_index_by_name(name: &str) -> AtrResult<Option<u32>> {
+    if let Ok(index) = name.parse::<u32>() {
+        return Ok(Some(index));
+    }
+    let name = name.trim().to_ascii_lowercase();
+    windows_adapters()?
+        .into_iter()
+        .find(|(adapter_name, _, _)| adapter_name.to_ascii_lowercase() == name)
+        .map(|(_, index, _)| index)
+        .ok_or_else(|| AtrError::InvalidArgument(format!("network interface not found: {name}")))
+        .map(Some)
+}
+
+#[cfg(target_os = "windows")]
+fn default_interface_index(_addr: &SocketAddr) -> Option<u32> {
+    let adapters = windows_adapters().ok()?;
+    adapters
+        .iter()
+        .filter(|(_, _, kind)| {
+            *kind == windows_sys::Win32::NetworkManagement::IpHelper::IF_TYPE_ETHERNET_CSMACD
+                || *kind == windows_sys::Win32::NetworkManagement::IpHelper::IF_TYPE_IEEE80211
+        })
+        .map(|(_, index, _)| *index)
+        .next()
+        .or_else(|| adapters.first().map(|(_, index, _)| *index))
 }
 
 #[cfg(target_family = "unix")]
@@ -733,9 +911,7 @@ fn send_tcp_dest(
     Ok(())
 }
 
-fn validate_tcp_tunnel_auth(
-    stream: &mut StreamOwned<ClientConnection, TcpStream>,
-) -> AtrResult<()> {
+fn wait_for_tcp_connect_status<S: Read + Write>(stream: &mut S) -> AtrResult<()> {
     loop {
         let mut header = [0u8; 2];
         read_tunnel_exact_blocking(stream, &mut header)?;
@@ -748,7 +924,7 @@ fn validate_tcp_tunnel_auth(
                 read_tunnel_exact_blocking(stream, &mut payload)?;
                 let text = String::from_utf8_lossy(&payload);
                 if text.contains("OK") || text.contains("Succeeded") {
-                    return Ok(());
+                    break;
                 }
                 return Err(AtrError::NetworkFailed(text.into_owned()));
             }
@@ -770,39 +946,57 @@ fn validate_tcp_tunnel_auth(
                 read_tunnel_exact_blocking(stream, &mut payload)?;
                 let text = String::from_utf8_lossy(&payload);
                 crate::diag_log(format!("[libreatrust][tcp] tunnel auth response {}", text));
-                if text.contains(r#""message":"OK""#) || text.contains(r#""message":"Succeeded""#) {
-                    return Ok(());
+                if text.contains("OK")
+                    || text.contains("Succeeded")
+                    || text.contains(r#""message":"OK""#)
+                    || text.contains(r#""message":"Succeeded""#)
+                {
+                    break;
                 }
                 return Err(AtrError::NetworkFailed(text.into_owned()));
             }
-            [0x05, status] => {
-                let mut tail = [0u8; 8];
-                read_tunnel_exact_blocking(stream, &mut tail)?;
-                crate::diag_log(format!(
-                    "[libreatrust][tcp] ignoring tunnel control status={:02x} tail={:02x?}",
-                    status, tail
-                ));
-            }
-            [0x01, 0x00] => {
-                return Err(AtrError::NetworkFailed(
-                    "unexpected application data during tcp tunnel auth".into(),
-                ));
-            }
-            [0x01, 0x01] => {
-                let mut tail = [0u8; 2];
-                read_tunnel_exact_blocking(stream, &mut tail)?;
+            _ => {
                 return Err(AtrError::NetworkFailed(format!(
-                    "tcp tunnel closed during auth: {:02x?}",
-                    tail
+                    "unexpected tcp tunnel response: {:02x} {:02x}",
+                    header[0], header[1]
                 )));
             }
-            _ => {
-                crate::diag_log(format!(
-                    "[libreatrust][tcp] ignoring tunnel auth header {:02x} {:02x}",
-                    header[0], header[1]
-                ));
-            }
         }
+    }
+
+    // The four-byte empty data frame asks the aTrust node to start the
+    // destination connection. The following 0x05 status is the actual
+    // result of connecting to the requested host and port.
+    stream.write_all(&[0x01, 0x00, 0x00, 0x00])?;
+    stream.flush()?;
+
+    let mut status = [0u8; 2];
+    read_tunnel_exact_blocking(stream, &mut status)?;
+    if status[0] != 0x05 {
+        return Err(AtrError::NetworkFailed(format!(
+            "unexpected tcp tunnel connect status: {:02x} {:02x}",
+            status[0], status[1]
+        )));
+    }
+    match status[1] {
+        0x00 => Ok(()),
+        0x01 => Err(AtrError::NetworkFailed("tcp tunnel server failure".into())),
+        0x02 => Err(AtrError::NetworkFailed(
+            "tcp tunnel connection not allowed".into(),
+        )),
+        0x03 => Err(AtrError::NetworkFailed("network is unreachable".into())),
+        0x04 => Err(AtrError::NetworkFailed("host is unreachable".into())),
+        0x05 => Err(AtrError::NetworkFailed("connection refused".into())),
+        0x06 => Err(AtrError::NetworkFailed("tcp tunnel TTL expired".into())),
+        0x07 => Err(AtrError::NetworkFailed(
+            "tcp tunnel command not supported".into(),
+        )),
+        0x08 => Err(AtrError::NetworkFailed(
+            "tcp tunnel address type not supported".into(),
+        )),
+        code => Err(AtrError::NetworkFailed(format!(
+            "tcp tunnel connect failed with status 0x{code:02X}"
+        ))),
     }
 }
 
@@ -1593,6 +1787,7 @@ fn connect_tls(
     let tcp = connect_tcp_bound(
         &socket_addr,
         Duration::from_millis(cfg.connect_timeout_ms.max(1)),
+        cfg,
     )?;
     tcp.set_write_timeout(Some(Duration::from_millis(cfg.io_timeout_ms)))?;
     let host = addr.split(':').next().unwrap_or(addr);
@@ -2413,5 +2608,79 @@ impl fmt::Display for PacketMeta {
             self.dst_ip,
             self.dst_port
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::wait_for_tcp_connect_status;
+    use std::io::{self, Cursor, Read, Write};
+
+    struct TestIo {
+        input: Cursor<Vec<u8>>,
+        output: Vec<u8>,
+    }
+
+    impl Read for TestIo {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.input.read(buf)
+        }
+    }
+
+    impl Write for TestIo {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.output.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn test_io(status: u8) -> TestIo {
+        TestIo {
+            input: Cursor::new(vec![0x53, 0x00, 0x00, 0x02, b'O', b'K', 0x05, status]),
+            output: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn waits_for_tcp_connect_success() {
+        let mut io = test_io(0x00);
+        assert!(wait_for_tcp_connect_status(&mut io).is_ok());
+        assert_eq!(io.output, [0x01, 0x00, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn accepts_intermediate_auth_response() {
+        let mut io = TestIo {
+            input: Cursor::new(vec![
+                0x05, 0x81, 0x53, 0x00, 0x00, 0x02, b'O', b'K', 0x05, 0x00,
+            ]),
+            output: Vec::new(),
+        };
+        assert!(wait_for_tcp_connect_status(&mut io).is_ok());
+        assert_eq!(io.output, [0x01, 0x00, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn maps_tcp_connect_statuses() {
+        for (status, message) in [
+            (0x01, "tcp tunnel server failure"),
+            (0x02, "tcp tunnel connection not allowed"),
+            (0x03, "network is unreachable"),
+            (0x04, "host is unreachable"),
+            (0x05, "connection refused"),
+            (0x06, "tcp tunnel TTL expired"),
+            (0x07, "tcp tunnel command not supported"),
+            (0x08, "tcp tunnel address type not supported"),
+            (0xff, "status 0xFF"),
+        ] {
+            let mut io = test_io(status);
+            let error = wait_for_tcp_connect_status(&mut io).unwrap_err();
+            assert!(error.to_string().contains(message), "{error}");
+            assert_eq!(io.output, [0x01, 0x00, 0x00, 0x00]);
+        }
     }
 }

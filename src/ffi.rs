@@ -175,6 +175,8 @@ pub struct atr_client_config_t {
     pub io_timeout_ms: u64,
     pub node_probe_timeout_ms: u64,
     pub allow_insecure_tls: bool,
+    pub bind_interface: *const c_char,
+    pub auto_detect_interface: bool,
 }
 
 #[repr(C)]
@@ -836,6 +838,12 @@ fn client_config_from_ffi(cfg: &atr_client_config_t) -> AtrResult<ClientConfig> 
         io_timeout_ms: cfg.io_timeout_ms,
         node_probe_timeout_ms: cfg.node_probe_timeout_ms,
         allow_insecure_tls: cfg.allow_insecure_tls,
+        bind_interface: if cfg.bind_interface.is_null() {
+            None
+        } else {
+            Some(cstr_to_string(cfg.bind_interface, "bind_interface")?)
+        },
+        auto_detect_interface: cfg.auto_detect_interface,
     })
 }
 

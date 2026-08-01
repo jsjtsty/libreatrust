@@ -132,6 +132,8 @@ typedef struct atr_client_config_t {
     uint64_t io_timeout_ms;
     uint64_t node_probe_timeout_ms;
     bool allow_insecure_tls;
+    const char *bind_interface;
+    bool auto_detect_interface;
 } atr_client_config_t;
 
 typedef struct atr_auth_config_t {

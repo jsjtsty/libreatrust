@@ -413,6 +413,7 @@ fn open_proxy_target(
             let stream = connect_tcp_bound(
                 &addr,
                 Duration::from_millis(config.connect_timeout_ms.max(1)),
+                client.client_config(),
             )?;
             stream.set_nodelay(true)?;
             Ok(ProxyRemote::Direct(stream))

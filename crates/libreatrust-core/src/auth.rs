@@ -20,9 +20,7 @@ use url::Url;
 #[derive(Debug, Clone)]
 enum PendingFlow {
     Password(PasswordLoginInput),
-    PasswordSms {
-        auth_id: String,
-    },
+    AuthStep(AuthStep),
     SmsLogin(SmsLoginInput),
     SmsVerify {
         phone: String,
@@ -103,19 +101,110 @@ struct PasswordResponseData {
 
 #[derive(Debug, Deserialize)]
 struct AuthCheckResponse {
+    #[serde(default)]
+    code: i64,
+    #[serde(default)]
+    message: String,
+    #[serde(default)]
     data: AuthCheckData,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 struct AuthCheckData {
+    #[serde(default, rename = "nextServiceList")]
+    next_service_list: Vec<AuthIdItem>,
+    #[serde(default, rename = "nextService")]
+    next_service: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AuthIdItem {
+    #[serde(default, rename = "authId")]
+    auth_id: String,
+    #[serde(default, rename = "authType")]
+    auth_type: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AuthStepResponse {
+    #[serde(default)]
+    code: i64,
+    #[serde(default)]
+    message: String,
+    #[serde(default)]
+    data: AuthStepData,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct AuthStepData {
+    #[serde(default, rename = "nextService")]
+    next_service: String,
     #[serde(default, rename = "nextServiceList")]
     next_service_list: Vec<AuthIdItem>,
 }
 
 #[derive(Debug, Deserialize)]
-struct AuthIdItem {
-    #[serde(rename = "authId")]
+struct CustomSmsResponse {
+    #[serde(default)]
+    code: i64,
+    #[serde(default)]
+    message: String,
+    #[serde(default)]
+    data: CustomSmsData,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct CustomSmsData {
+    #[serde(default)]
+    tips: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SmsMode {
+    WithAuthId,
+    WithoutAuthId,
+    Custom,
+}
+
+#[derive(Debug, Clone)]
+struct AuthStep {
+    service: String,
     auth_id: String,
+    sms_mode: Option<SmsMode>,
+}
+
+fn auth_step_from_data(data: AuthStepData) -> AuthStep {
+    let mut service = data.next_service;
+    let selected = data
+        .next_service_list
+        .iter()
+        .find(|item| !service.is_empty() && item.auth_type == service)
+        .or_else(|| data.next_service_list.first());
+    let auth_id = selected
+        .map(|item| item.auth_id.clone())
+        .unwrap_or_default();
+    if service.is_empty() {
+        service = selected
+            .map(|item| item.auth_type.clone())
+            .unwrap_or_default();
+    }
+    if service.is_empty() && !auth_id.is_empty() {
+        service = "auth/sms".into();
+    }
+    let sms_mode = match service.as_str() {
+        "auth/sms" => Some(if auth_id.is_empty() {
+            SmsMode::WithoutAuthId
+        } else {
+            SmsMode::WithAuthId
+        }),
+        "auth/customSms" => Some(SmsMode::Custom),
+        _ => None,
+    };
+    AuthStep {
+        service,
+        auth_id,
+        sms_mode,
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -227,7 +316,7 @@ impl AuthSession {
                 login_domain,
                 code,
             } => self.run_sms_verify(&phone, &login_domain, &code, captcha),
-            PendingFlow::PasswordSms { .. } => Err(AtrError::InvalidState(
+            PendingFlow::AuthStep(_) => Err(AtrError::InvalidState(
                 "captcha is not expected here".into(),
             )),
         }
@@ -239,7 +328,13 @@ impl AuthSession {
             .clone()
             .ok_or_else(|| AtrError::InvalidState("no pending sms flow".into()))?;
         match pending {
-            PendingFlow::PasswordSms { auth_id } => self.verify_password_sms(&auth_id, code),
+            PendingFlow::AuthStep(step) => {
+                let (code, skip_secondary_auth) = code
+                    .strip_prefix('$')
+                    .map_or((code, false), |code| (code, true));
+                let next = self.complete_auth_step(&step, code, skip_secondary_auth)?;
+                self.continue_auth(next)
+            }
             PendingFlow::SmsLogin(input) => {
                 self.pending = Some(PendingFlow::SmsVerify {
                     phone: input.phone,
@@ -372,14 +467,8 @@ impl AuthSession {
             self.pending = Some(PendingFlow::SmsLogin(input.clone()));
             return Ok(AuthChallenge::NeedCaptcha { image });
         }
-        let auth_id = self
-            .auth_check()?
-            .ok_or_else(|| AtrError::InvalidState("sms auth id missing".into()))?;
-        self.trigger_password_sms(&auth_id)?;
-        self.pending = Some(PendingFlow::PasswordSms {
-            auth_id: auth_id.clone(),
-        });
-        Ok(AuthChallenge::NeedSmsCode { auth_id })
+        let step = self.auth_check()?;
+        self.continue_auth(step)
     }
 
     fn run_sms_verify(
@@ -404,8 +493,16 @@ impl AuthSession {
         self.finish_login(false)
     }
 
-    fn verify_password_sms(&mut self, auth_id: &str, code: &str) -> AtrResult<AuthChallenge> {
-        self.post_password_sms_check(auth_id, code)?;
+    fn finish_login(&mut self, update_mod: bool) -> AtrResult<AuthChallenge> {
+        if update_mod {
+            let _ = self.auth_config_mod()?;
+        }
+        self.report_env()?;
+        let step = self.auth_check()?;
+        return self.continue_auth(step);
+    }
+
+    fn complete_login(&mut self) -> AtrResult<AuthChallenge> {
         self.pending = None;
         let username = self.online_info()?;
         self.username = username.clone();
@@ -420,30 +517,67 @@ impl AuthSession {
         }))
     }
 
-    fn finish_login(&mut self, update_mod: bool) -> AtrResult<AuthChallenge> {
-        if update_mod {
-            let _ = self.auth_config_mod()?;
+    fn continue_auth(&mut self, mut step: AuthStep) -> AtrResult<AuthChallenge> {
+        for _ in 0..8 {
+            match step.service.as_str() {
+                "" => return self.complete_login(),
+                "auth/authCheck" => step = self.auth_check()?,
+                "auth/sms" => return self.begin_sms(step),
+                "auth/customSms" => return self.begin_custom_sms(),
+                service => {
+                    return Err(AtrError::Unsupported(format!(
+                        "unsupported next authentication service: {service}"
+                    )));
+                }
+            }
         }
-        self.report_env()?;
-        if let Some(auth_id) = self.auth_check()? {
-            self.trigger_password_sms(&auth_id)?;
-            self.pending = Some(PendingFlow::PasswordSms {
-                auth_id: auth_id.clone(),
-            });
-            return Ok(AuthChallenge::NeedSmsCode { auth_id });
+        Err(AtrError::Unauthorized(
+            "authentication chain exceeded 8 steps".into(),
+        ))
+    }
+
+    fn begin_sms(&mut self, step: AuthStep) -> AtrResult<AuthChallenge> {
+        let mode = step
+            .sms_mode
+            .ok_or_else(|| AtrError::InvalidState("missing SMS authentication mode".into()))?;
+        if mode == SmsMode::WithAuthId {
+            let _ = self.auth_config_refresh()?;
         }
-        self.pending = None;
-        let username = self.online_info()?;
-        self.username = username.clone();
-        self.sync_sid_from_cookies();
-        Ok(AuthChallenge::Done(SessionMaterial {
-            username,
-            sid: self.sid.clone(),
-            device_id: self.device_id.clone(),
-            connection_id: self.connection_id.clone(),
-            sign_key_hex: self.sign_key_hex.clone(),
-            cookies: self.collect_cookies(),
-        }))
+        self.log_phone_number(&step.auth_id);
+        self.trigger_password_sms_step(&step)?;
+        if mode == SmsMode::WithoutAuthId {
+            let _ = self.auth_config_refresh()?;
+        }
+        let auth_id = step.auth_id.clone();
+        self.pending = Some(PendingFlow::AuthStep(step));
+        Ok(AuthChallenge::NeedSmsCode { auth_id })
+    }
+
+    fn begin_custom_sms(&mut self) -> AtrResult<AuthChallenge> {
+        self.send_custom_sms()?;
+        self.pending = Some(PendingFlow::AuthStep(AuthStep {
+            service: "auth/customSms".into(),
+            auth_id: String::new(),
+            sms_mode: Some(SmsMode::Custom),
+        }));
+        Ok(AuthChallenge::NeedSmsCode {
+            auth_id: String::new(),
+        })
+    }
+
+    fn complete_auth_step(
+        &mut self,
+        step: &AuthStep,
+        code: &str,
+        skip_secondary_auth: bool,
+    ) -> AtrResult<AuthStep> {
+        match step.sms_mode {
+            Some(SmsMode::Custom) => self.custom_sms_check_code(code, skip_secondary_auth),
+            Some(SmsMode::WithAuthId) | Some(SmsMode::WithoutAuthId) => {
+                self.password_sms_check(step, code, skip_secondary_auth)
+            }
+            None => Err(AtrError::InvalidState("invalid authentication step".into())),
+        }
     }
 
     fn fetch_client_resource(&mut self) -> AtrResult<Vec<u8>> {
@@ -494,6 +628,10 @@ impl AuthSession {
     fn auth_config_mod(&mut self) -> AtrResult<(bool, Vec<AuthMethodInfo>)> {
         self.auth_config_impl(&[("mod", "1")])
             .map(|(is_login, methods)| (is_login, methods))
+    }
+
+    fn auth_config_refresh(&mut self) -> AtrResult<(bool, Vec<AuthMethodInfo>)> {
+        self.auth_config_impl(&[("mod", "1"), ("needTicket", "1")])
     }
 
     fn auth_config_impl(
@@ -672,7 +810,54 @@ impl AuthSession {
         Ok(serde_json::from_str(&resp.text()?)?)
     }
 
-    fn trigger_password_sms(&mut self, auth_id: &str) -> AtrResult<()> {
+    fn log_phone_number(&mut self, auth_id: &str) {
+        let result = (|| -> AtrResult<()> {
+            let mut url = self.base_url.join("/passport/v1/public/phoneNumber")?;
+            {
+                let mut qp = url.query_pairs_mut();
+                for (k, v) in self.shared_params() {
+                    qp.append_pair(&k, &v);
+                }
+                if !auth_id.is_empty() {
+                    qp.append_pair("authId", auth_id);
+                }
+            }
+            let resp = self
+                .client
+                .get(url)
+                .header("User-Agent", &self.config.user_agent)
+                .header("x-csrf-token", &self.csrf_token)
+                .header("x-sdp-traceid", self.trace_id())
+                .send()?;
+            self.capture_cookies(&resp)?;
+            let value: Value = serde_json::from_str(&resp.text()?)?;
+            let numbers = value
+                .get("data")
+                .and_then(|data| data.get("phoneNumber"))
+                .and_then(|value| match value {
+                    Value::Array(values) => {
+                        Some(values.iter().filter_map(Value::as_str).collect::<Vec<_>>())
+                    }
+                    Value::String(value) if !value.is_empty() => Some(vec![value.as_str()]),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            if !numbers.is_empty() {
+                crate::diag_log(format!(
+                    "[libreatrust][auth] available phone numbers: {}",
+                    numbers.join(", ")
+                ));
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            crate::diag_log(format!(
+                "[libreatrust][auth] phone number lookup skipped: {error}"
+            ));
+        }
+    }
+
+    fn trigger_password_sms_step(&mut self, step: &AuthStep) -> AtrResult<()> {
         let mut url = self.base_url.join("/passport/v1/auth/sms")?;
         {
             let mut qp = url.query_pairs_mut();
@@ -680,9 +865,11 @@ impl AuthSession {
                 qp.append_pair(&k, &v);
             }
             qp.append_pair("action", "sendsms");
-            qp.append_pair("isPrevEffect", "0");
-            qp.append_pair("taskId", "");
-            qp.append_pair("authId", auth_id);
+            if step.sms_mode == Some(SmsMode::WithAuthId) {
+                qp.append_pair("isPrevEffect", "0");
+                qp.append_pair("taskId", "");
+                qp.append_pair("authId", &step.auth_id);
+            }
         }
         let resp = self
             .client
@@ -703,7 +890,12 @@ impl AuthSession {
         Ok(())
     }
 
-    fn post_password_sms_check(&mut self, auth_id: &str, code: &str) -> AtrResult<()> {
+    fn password_sms_check(
+        &mut self,
+        step: &AuthStep,
+        code: &str,
+        skip_secondary_auth: bool,
+    ) -> AtrResult<AuthStep> {
         let mut url = self.base_url.join("/passport/v1/auth/sms")?;
         {
             let mut qp = url.query_pairs_mut();
@@ -712,12 +904,53 @@ impl AuthSession {
             }
             qp.append_pair("action", "checkcode");
         }
+        let skip = if skip_secondary_auth { "1" } else { "0" };
+        let resp = if step.sms_mode == Some(SmsMode::WithoutAuthId) {
+            let payload = [("code", code), ("skipSecondaryAuth", skip)];
+            self.client
+                .post(url)
+                .header("User-Agent", &self.config.user_agent)
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .header("x-csrf-token", &self.csrf_token)
+                .header("x-sdp-traceid", self.trace_id())
+                .form(&payload)
+                .send()?
+        } else {
+            let payload = json!({
+                "isPrevEffect": false,
+                "code": code,
+                "skipSecondaryAuth": skip,
+                "taskId": "",
+                "authId": step.auth_id
+            });
+            self.client
+                .post(url)
+                .header("User-Agent", &self.config.user_agent)
+                .header("Content-Type", "application/json;charset=utf-8")
+                .header("x-csrf-token", &self.csrf_token)
+                .header("x-sdp-traceid", self.trace_id())
+                .body(payload.to_string())
+                .send()?
+        };
+        self.capture_cookies(&resp)?;
+        let parsed: AuthStepResponse = serde_json::from_str(&resp.text()?)?;
+        if parsed.code != 0 {
+            return Err(AtrError::Unauthorized(format!(
+                "smsCheckCode failed: {} {}",
+                parsed.code, parsed.message
+            )));
+        }
+        Ok(auth_step_from_data(parsed.data))
+    }
+
+    fn send_custom_sms(&mut self) -> AtrResult<()> {
+        let url = self.base_url.join("/passport/v1/auth/customSms")?;
+        let mut params = self.shared_params();
+        params.push(("action".into(), "sendcustomsms".into()));
+        let url = url_with_params(url, &params)?;
         let payload = json!({
-            "isPrevEffect": false,
-            "code": code,
-            "skipSecondaryAuth": "0",
-            "taskId": "",
-            "authId": auth_id
+            "isPrevEffect": "0",
+            "taskId": ""
         });
         let resp = self
             .client
@@ -729,17 +962,56 @@ impl AuthSession {
             .body(payload.to_string())
             .send()?;
         self.capture_cookies(&resp)?;
-        let parsed: CodeResponse = serde_json::from_str(&resp.text()?)?;
+        let parsed: CustomSmsResponse = serde_json::from_str(&resp.text()?)?;
         if parsed.code != 0 {
             return Err(AtrError::Unauthorized(format!(
-                "smsCheckCode failed: {}",
-                parsed.code
+                "sendCustomSMS failed: {} {}",
+                parsed.code, parsed.message
             )));
         }
+        crate::diag_log(format!(
+            "[libreatrust][auth] custom SMS: {}",
+            parsed.data.tips
+        ));
         Ok(())
     }
 
-    fn auth_check(&mut self) -> AtrResult<Option<String>> {
+    fn custom_sms_check_code(
+        &mut self,
+        code: &str,
+        skip_secondary_auth: bool,
+    ) -> AtrResult<AuthStep> {
+        let url = self.base_url.join("/passport/v1/auth/customSms")?;
+        let mut params = self.shared_params();
+        params.push(("action".into(), "checkcustomcode".into()));
+        let url = url_with_params(url, &params)?;
+        let payload = json!({
+            "isPrevEffect": false,
+            "customCode": code,
+            "skipSecondaryAuth": if skip_secondary_auth { "1" } else { "0" },
+            "taskId": ""
+        });
+        let resp = self
+            .client
+            .post(url)
+            .header("User-Agent", &self.config.user_agent)
+            .header("Content-Type", "application/json;charset=utf-8")
+            .header("x-csrf-token", &self.csrf_token)
+            .header("x-sdp-traceid", self.trace_id())
+            .body(payload.to_string())
+            .send()?;
+        self.capture_cookies(&resp)?;
+        let parsed: AuthStepResponse = serde_json::from_str(&resp.text()?)?;
+        if parsed.code != 0 {
+            return Err(AtrError::Unauthorized(format!(
+                "customSMSCheckCode failed: {} {}",
+                parsed.code, parsed.message
+            )));
+        }
+        Ok(auth_step_from_data(parsed.data))
+    }
+
+    fn auth_check(&mut self) -> AtrResult<AuthStep> {
         let mut url = self.base_url.join("/passport/v1/auth/authCheck")?;
         {
             let mut qp = url.query_pairs_mut();
@@ -756,11 +1028,16 @@ impl AuthSession {
             .send()?;
         self.capture_cookies(&resp)?;
         let parsed: AuthCheckResponse = serde_json::from_str(&resp.text()?)?;
-        Ok(parsed
-            .data
-            .next_service_list
-            .first()
-            .map(|item| item.auth_id.clone()))
+        if parsed.code != 0 {
+            return Err(AtrError::Unauthorized(format!(
+                "authCheck failed: {} {}",
+                parsed.code, parsed.message
+            )));
+        }
+        Ok(auth_step_from_data(AuthStepData {
+            next_service: parsed.data.next_service,
+            next_service_list: parsed.data.next_service_list,
+        }))
     }
 
     fn report_env(&mut self) -> AtrResult<()> {
@@ -1067,6 +1344,37 @@ fn short_response_body(body: &[u8]) -> String {
         return text.to_string();
     }
     format!("{}...", text.chars().take(MAX_LEN).collect::<String>())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AuthIdItem, AuthStepData, SmsMode, auth_step_from_data};
+
+    #[test]
+    fn maps_auth_steps_and_sms_modes() {
+        let with_id = auth_step_from_data(AuthStepData {
+            next_service: String::new(),
+            next_service_list: vec![AuthIdItem {
+                auth_id: "auth-1".into(),
+                auth_type: "auth/sms".into(),
+            }],
+        });
+        assert_eq!(with_id.service, "auth/sms");
+        assert_eq!(with_id.auth_id, "auth-1");
+        assert_eq!(with_id.sms_mode, Some(SmsMode::WithAuthId));
+
+        let without_id = auth_step_from_data(AuthStepData {
+            next_service: "auth/sms".into(),
+            next_service_list: Vec::new(),
+        });
+        assert_eq!(without_id.sms_mode, Some(SmsMode::WithoutAuthId));
+
+        let custom = auth_step_from_data(AuthStepData {
+            next_service: "auth/customSms".into(),
+            next_service_list: Vec::new(),
+        });
+        assert_eq!(custom.sms_mode, Some(SmsMode::Custom));
+    }
 }
 
 fn random_hex(len: usize) -> String {

@@ -9,6 +9,8 @@ pub struct ClientConfig {
     pub io_timeout_ms: u64,
     pub node_probe_timeout_ms: u64,
     pub allow_insecure_tls: bool,
+    pub bind_interface: Option<String>,
+    pub auto_detect_interface: bool,
 }
 
 impl Default for ClientConfig {
@@ -21,6 +23,8 @@ impl Default for ClientConfig {
             io_timeout_ms: 20_000,
             node_probe_timeout_ms: 3_000,
             allow_insecure_tls: true,
+            bind_interface: None,
+            auto_detect_interface: true,
         }
     }
 }

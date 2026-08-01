@@ -557,8 +557,10 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "socket2",
  "thiserror",
  "url",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
