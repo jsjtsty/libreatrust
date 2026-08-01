@@ -15,6 +15,7 @@ typedef struct atr_tcp_tunnel_t atr_tcp_tunnel_t;
 typedef struct atr_udp_tunnel_t atr_udp_tunnel_t;
 typedef struct atr_l3_tunnel_t atr_l3_tunnel_t;
 typedef struct atr_proxy_service_t atr_proxy_service_t;
+typedef struct atr_keep_alive_service_t atr_keep_alive_service_t;
 
 typedef enum atr_error_code {
     ATR_OK = 0,
@@ -233,6 +234,16 @@ typedef struct atr_proxy_service_stats_t {
     char *last_event_message;
 } atr_proxy_service_stats_t;
 
+typedef struct atr_keep_alive_config_t {
+    uint64_t interval_ms;
+    const char *url;
+} atr_keep_alive_config_t;
+
+typedef struct atr_keep_alive_status_t {
+    uint64_t probe_count;
+    char *last_error;
+} atr_keep_alive_status_t;
+
 typedef struct atr_auth_challenge_t {
     atr_auth_challenge_kind_t kind;
     atr_blob_t image;
@@ -283,6 +294,11 @@ int atr_l3_tunnel_write_packet(const atr_l3_tunnel_t *tunnel, const uint8_t *buf
 int atr_l3_tunnel_get_virtual_ips(const atr_l3_tunnel_t *tunnel, atr_string_list_t *out);
 
 int atr_client_start_proxy_service(const atr_client_t *client, const atr_proxy_service_config_t *config, atr_proxy_service_t **out);
+int atr_client_start_keep_alive(const atr_client_t *client, const atr_keep_alive_config_t *config, atr_keep_alive_service_t **out);
+int atr_keep_alive_stop(const atr_keep_alive_service_t *service);
+int atr_keep_alive_get_status(const atr_keep_alive_service_t *service, atr_keep_alive_status_t *out);
+void atr_keep_alive_status_free(atr_keep_alive_status_t *status);
+void atr_keep_alive_free(atr_keep_alive_service_t *service);
 int atr_proxy_service_stop(const atr_proxy_service_t *service);
 int atr_proxy_service_status(const atr_proxy_service_t *service, atr_proxy_service_status_t *out);
 int atr_proxy_service_get_endpoint(const atr_proxy_service_t *service, atr_proxy_service_endpoint_t *out);

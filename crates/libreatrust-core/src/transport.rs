@@ -1793,17 +1793,22 @@ fn connect_tls(
     let host = addr.split(':').next().unwrap_or(addr);
     let server_name = ServerName::try_from(host.to_string())
         .map_err(|_| AtrError::InvalidArgument(format!("invalid host {host}")))?;
-    let client_cfg = TlsClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(NoVerifier))
-        .with_no_client_auth();
-    let conn = ClientConnection::new(Arc::new(client_cfg), server_name)
+    let conn = ClientConnection::new(client_tls_config(), server_name)
         .map_err(|e| AtrError::NetworkFailed(e.to_string()))?;
     Ok(StreamOwned::new(conn, tcp))
 }
 
+pub(crate) fn client_tls_config() -> Arc<TlsClientConfig> {
+    Arc::new(
+        TlsClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerifier))
+            .with_no_client_auth(),
+    )
+}
+
 #[derive(Debug)]
-struct NoVerifier;
+pub(crate) struct NoVerifier;
 
 impl ServerCertVerifier for NoVerifier {
     fn verify_server_cert(
