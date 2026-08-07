@@ -89,11 +89,17 @@ struct CodeResponse {
 
 #[derive(Debug, Deserialize)]
 struct PasswordResponse {
+    #[serde(default)]
+    code: i64,
+    #[serde(default)]
+    message: String,
+    #[serde(default)]
     data: PasswordResponseData,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 struct PasswordResponseData {
+    #[serde(default)]
     ticket: String,
     #[serde(default, rename = "graphCheckCodeEnable")]
     graph_check_code_enable: i32,
@@ -449,7 +455,7 @@ impl AuthSession {
     ) -> AtrResult<AuthChallenge> {
         let _ = self.auth_config_init()?;
         let response = self.post_password(input, captcha)?;
-        if response.data.graph_check_code_enable != 0 && captcha.is_empty() {
+        if response.data.graph_check_code_enable != 0 {
             let image = self.fetch_captcha()?;
             self.pending = Some(PendingFlow::Password(input.clone()));
             return Ok(AuthChallenge::NeedCaptcha { image });
@@ -712,7 +718,16 @@ impl AuthSession {
             .body(body)
             .send()?;
         self.capture_cookies(&resp)?;
-        Ok(serde_json::from_str(&resp.text()?)?)
+        let response: PasswordResponse = serde_json::from_str(&resp.text()?)?;
+        let captcha_challenge = response.data.graph_check_code_enable != 0;
+        if response.code != 0 && !captcha_challenge {
+            return Err(AtrError::Unauthorized(if response.message.is_empty() {
+                format!("password authentication failed with code {}", response.code)
+            } else {
+                response.message.clone()
+            }));
+        }
+        Ok(response)
     }
 
     fn password_payload(&self, input: &PasswordLoginInput, captcha: &str) -> AtrResult<String> {
@@ -1348,7 +1363,22 @@ fn short_response_body(body: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{AuthIdItem, AuthStepData, SmsMode, auth_step_from_data};
+    use super::{
+        AuthIdItem, AuthStepData, PasswordResponse, SmsMode, auth_step_from_data,
+    };
+
+    #[test]
+    fn password_captcha_response_allows_missing_ticket() {
+        let response: PasswordResponse = serde_json::from_str(
+            r#"{"code":1,"message":"captcha required","data":{"graphCheckCodeEnable":1}}"#,
+        )
+        .expect("captcha response should parse before a ticket is issued");
+
+        assert_eq!(response.code, 1);
+        assert_eq!(response.message, "captcha required");
+        assert_eq!(response.data.graph_check_code_enable, 1);
+        assert!(response.data.ticket.is_empty());
+    }
 
     #[test]
     fn maps_auth_steps_and_sms_modes() {
