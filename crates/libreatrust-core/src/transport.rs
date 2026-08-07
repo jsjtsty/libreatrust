@@ -9,6 +9,7 @@ use rustls::{ClientConfig as TlsClientConfig, ClientConnection, StreamOwned};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::Digest;
+use socket2::{SockRef, TcpKeepalive};
 use std::collections::{HashMap, VecDeque};
 use std::env;
 #[cfg(target_family = "unix")]
@@ -30,6 +31,7 @@ pub struct TcpTunnel {
     wake_tx: Mutex<TcpStream>,
     read_buf: Mutex<VecDeque<u8>>,
     closed: AtomicBool,
+    worker: Mutex<Option<thread::JoinHandle<()>>>,
 }
 
 #[derive(Debug)]
@@ -48,6 +50,10 @@ pub struct UdpTunnel {
     incoming_rx: Mutex<mpsc::Receiver<Vec<u8>>>,
     close_flag: Arc<AtomicBool>,
 }
+
+const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(15);
+const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+const TCP_KEEPALIVE_RETRIES: u32 = 3;
 
 impl TcpTunnel {
     pub fn connect(client: &AtrClient, host: &str, port: u16) -> AtrResult<Self> {
@@ -86,7 +92,12 @@ impl TcpTunnel {
         let (wake_rx, wake_tx) = tcp_stream_pair()?;
         wake_rx.set_nonblocking(true)?;
         wake_tx.set_nonblocking(true)?;
-        thread::spawn(move || run_tcp_tunnel_worker(stream, incoming_tx, write_rx, wake_rx));
+        let worker = thread::Builder::new()
+            .name("libreatrust-tcp-tunnel".into())
+            .spawn(move || run_tcp_tunnel_worker(stream, incoming_tx, write_rx, wake_rx))
+            .map_err(|err| {
+                AtrError::Internal(format!("failed to start tcp tunnel worker: {err}"))
+            })?;
 
         Ok(Self {
             incoming_rx: Mutex::new(incoming_rx),
@@ -94,6 +105,7 @@ impl TcpTunnel {
             wake_tx: Mutex::new(wake_tx),
             read_buf: Mutex::new(VecDeque::new()),
             closed: AtomicBool::new(false),
+            worker: Mutex::new(Some(worker)),
         })
     }
 
@@ -109,7 +121,7 @@ impl TcpTunnel {
                     break;
                 }
             }
-            if copied == buf.len() {
+            if copied > 0 || copied == buf.len() {
                 return Ok(copied);
             }
         }
@@ -131,6 +143,9 @@ impl TcpTunnel {
     }
 
     pub fn write(&self, data: &[u8]) -> AtrResult<usize> {
+        if data.is_empty() {
+            return Ok(0);
+        }
         if self.closed.load(Ordering::SeqCst) {
             return Err(AtrError::InvalidState("tcp tunnel closed".into()));
         }
@@ -145,11 +160,13 @@ impl TcpTunnel {
     }
 
     pub fn close(&self) -> AtrResult<()> {
-        if self.closed.swap(true, Ordering::SeqCst) {
-            return Ok(());
+        if !self.closed.swap(true, Ordering::SeqCst) {
+            let _ = self.write_tx.send(TcpTunnelCommand::Close);
+            self.wake_worker();
         }
-        let _ = self.write_tx.send(TcpTunnelCommand::Close);
-        self.wake_worker();
+        if let Some(worker) = self.worker.lock().unwrap().take() {
+            let _ = worker.join();
+        }
         Ok(())
     }
 
@@ -157,6 +174,12 @@ impl TcpTunnel {
         if let Ok(mut wake_tx) = self.wake_tx.lock() {
             let _ = wake_tx.write_all(&[1]);
         }
+    }
+}
+
+impl Drop for TcpTunnel {
+    fn drop(&mut self) {
+        let _ = self.close();
     }
 }
 
@@ -205,11 +228,12 @@ fn drain_tcp_tunnel_frames(
     let _ = stream.sock.set_read_timeout(Some(Duration::from_millis(1)));
     let result = loop {
         match read_tcp_frame(stream) {
-            Ok(Some(data)) => {
+            Ok(Some(TcpFrameRead::Data(data))) => {
                 if incoming_tx.send(Ok(data)).is_err() {
                     break false;
                 }
             }
+            Ok(Some(TcpFrameRead::Control)) => continue,
             Ok(None) => break true,
             Err(error) => {
                 let _ = incoming_tx.send(Err(error));
@@ -222,6 +246,11 @@ fn drain_tcp_tunnel_frames(
         let _ = stream.sock.shutdown(Shutdown::Both);
     }
     result
+}
+
+enum TcpFrameRead {
+    Data(Vec<u8>),
+    Control,
 }
 
 fn drain_tcp_tunnel_commands(
@@ -331,7 +360,7 @@ pub(crate) fn connect_tcp_bound(
         manual_index.or_else(|| auto_detect.then(|| default_interface_index(addr)).flatten());
     let result = connect_tcp_bound_once(addr, timeout, selected_index);
     if result.is_ok() || !auto_detect {
-        return result;
+        return result.and_then(configure_connected_tcp);
     }
     let refreshed_index = default_interface_index(addr);
     if refreshed_index == selected_index {
@@ -341,7 +370,57 @@ pub(crate) fn connect_tcp_bound(
         "[libreatrust][transport] retrying outbound connection after interface refresh: {:?} -> {:?}",
         selected_index, refreshed_index
     ));
-    connect_tcp_bound_once(addr, timeout, refreshed_index)
+    connect_tcp_bound_once(addr, timeout, refreshed_index).and_then(configure_connected_tcp)
+}
+
+fn configure_connected_tcp(stream: TcpStream) -> AtrResult<TcpStream> {
+    stream.set_nodelay(true)?;
+
+    let socket = SockRef::from(&stream);
+    let keepalive = TcpKeepalive::new().with_time(TCP_KEEPALIVE_IDLE);
+    #[cfg(any(
+        target_os = "android",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "fuchsia",
+        target_os = "illumos",
+        target_os = "ios",
+        target_os = "visionos",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "netbsd",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "windows",
+        target_os = "cygwin"
+    ))]
+    let keepalive = keepalive.with_interval(TCP_KEEPALIVE_INTERVAL);
+    #[cfg(any(
+        target_os = "android",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "fuchsia",
+        target_os = "illumos",
+        target_os = "ios",
+        target_os = "visionos",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "netbsd",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "windows",
+        target_os = "cygwin"
+    ))]
+    let keepalive = keepalive.with_retries(TCP_KEEPALIVE_RETRIES);
+    if let Err(err) = socket.set_tcp_keepalive(&keepalive) {
+        // TCP keepalive tuning is not uniformly supported. Keep the connection
+        // usable when the platform only supports a subset of these options.
+        crate::diag_log(format!(
+            "[libreatrust][transport] failed to configure TCP keepalive: {err}"
+        ));
+        let _ = socket.set_keepalive(true);
+    }
+    Ok(stream)
 }
 
 #[cfg(target_family = "unix")]
@@ -1000,25 +1079,22 @@ fn wait_for_tcp_connect_status<S: Read + Write>(stream: &mut S) -> AtrResult<()>
     }
 }
 
-fn write_tcp_payload(
-    stream: &mut StreamOwned<ClientConnection, TcpStream>,
-    data: &[u8],
-) -> AtrResult<usize> {
-    if data.len() > u16::MAX as usize {
-        return Err(AtrError::InvalidArgument("tcp payload too large".into()));
+fn write_tcp_payload<W: Write>(stream: &mut W, data: &[u8]) -> AtrResult<usize> {
+    if data.is_empty() {
+        return Ok(0);
     }
-    let mut frame = Vec::with_capacity(4 + data.len());
-    frame.extend_from_slice(&[0x01, 0x00]);
-    frame.extend_from_slice(&(data.len() as u16).to_be_bytes());
-    frame.extend_from_slice(data);
-    stream.write_all(&frame)?;
+    for chunk in data.chunks(u16::MAX as usize) {
+        let mut frame = Vec::with_capacity(4 + chunk.len());
+        frame.extend_from_slice(&[0x01, 0x00]);
+        frame.extend_from_slice(&(chunk.len() as u16).to_be_bytes());
+        frame.extend_from_slice(chunk);
+        stream.write_all(&frame)?;
+    }
     stream.flush()?;
     Ok(data.len())
 }
 
-fn read_tcp_frame(
-    stream: &mut StreamOwned<ClientConnection, TcpStream>,
-) -> AtrResult<Option<Vec<u8>>> {
+fn read_tcp_frame<R: Read>(stream: &mut R) -> AtrResult<Option<TcpFrameRead>> {
     let mut header = [0u8; 2];
     if !read_tunnel_exact(stream, &mut header)? {
         return Ok(None);
@@ -1030,7 +1106,7 @@ fn read_tcp_frame(
             let len = u16::from_be_bytes(len_bytes) as usize;
             let mut data = vec![0u8; len];
             read_tunnel_exact_blocking(stream, &mut data)?;
-            Ok(Some(data))
+            Ok(Some(TcpFrameRead::Data(data)))
         }
         [0x01, 0x01] => {
             let mut tail = [0u8; 2];
@@ -1040,7 +1116,7 @@ fn read_tcp_frame(
                     "connection closed by server".into(),
                 ));
             }
-            Ok(None)
+            Ok(Some(TcpFrameRead::Control))
         }
         [0x53, 0x00] => {
             let mut len_bytes = [0u8; 2];
@@ -1053,7 +1129,7 @@ fn read_tcp_frame(
                     String::from_utf8_lossy(&payload).into_owned(),
                 ));
             }
-            Ok(None)
+            Ok(Some(TcpFrameRead::Control))
         }
         [0x05, 0x81] => {
             let mut marker = [0u8; 2];
@@ -1063,7 +1139,7 @@ fn read_tcp_frame(
                     "[libreatrust][tcp] ignoring tunnel auth marker {:02x?}",
                     marker
                 ));
-                return Ok(None);
+                return Ok(Some(TcpFrameRead::Control));
             }
 
             let mut len_bytes = [0u8; 2];
@@ -1076,7 +1152,7 @@ fn read_tcp_frame(
             if !text.contains(r#""message":"OK""#) && !text.contains(r#""message":"Succeeded""#) {
                 return Err(AtrError::NetworkFailed(text.into_owned()));
             }
-            Ok(None)
+            Ok(Some(TcpFrameRead::Control))
         }
         [0x05, status] => {
             let mut tail = [0u8; 8];
@@ -1085,14 +1161,17 @@ fn read_tcp_frame(
                 "[libreatrust][tcp] ignoring tunnel control status={:02x} tail={:02x?}",
                 status, tail
             ));
-            Ok(None)
+            Ok(Some(TcpFrameRead::Control))
         }
         _ => {
+            // The aTrust data stream may contain undocumented two-byte
+            // extension/control headers. Match the upstream behavior by
+            // consuming them and continuing to drain already-buffered frames.
             crate::diag_log(format!(
-                "[libreatrust][tcp] ignoring tunnel header {:02x} {:02x}",
+                "[libreatrust][tcp] ignoring tunnel extension header {:02x} {:02x}",
                 header[0], header[1]
             ));
-            Ok(None)
+            Ok(Some(TcpFrameRead::Control))
         }
     }
 }
@@ -2618,8 +2697,16 @@ impl fmt::Display for PacketMeta {
 
 #[cfg(test)]
 mod tests {
-    use super::wait_for_tcp_connect_status;
+    use super::{
+        TcpFrameRead, TcpTunnel, TcpTunnelCommand, configure_connected_tcp, read_tcp_frame,
+        tcp_stream_pair, wait_for_tcp_connect_status, write_tcp_payload,
+    };
+    use socket2::SockRef;
+    use std::collections::VecDeque;
     use std::io::{self, Cursor, Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Mutex, mpsc};
 
     struct TestIo {
         input: Cursor<Vec<u8>>,
@@ -2687,5 +2774,91 @@ mod tests {
             assert!(error.to_string().contains(message), "{error}");
             assert_eq!(io.output, [0x01, 0x00, 0x00, 0x00]);
         }
+    }
+
+    #[test]
+    fn splits_large_tcp_writes_into_protocol_frames() {
+        let data = vec![0x5a; u16::MAX as usize + 17];
+        let mut output = Vec::new();
+        assert_eq!(write_tcp_payload(&mut output, &data).unwrap(), data.len());
+
+        let first_len = u16::from_be_bytes([output[2], output[3]]) as usize;
+        assert_eq!(&output[..2], &[0x01, 0x00]);
+        assert_eq!(first_len, u16::MAX as usize);
+        let second = 4 + first_len;
+        assert_eq!(&output[second..second + 2], &[0x01, 0x00]);
+        assert_eq!(
+            u16::from_be_bytes([output[second + 2], output[second + 3]]),
+            17
+        );
+        assert_eq!(output.len(), data.len() + 8);
+    }
+
+    #[test]
+    fn returns_cached_tcp_data_without_waiting_for_another_frame() {
+        let (incoming_tx, incoming_rx) = mpsc::channel();
+        incoming_tx.send(Ok(vec![1, 2, 3, 4, 5])).unwrap();
+        let (write_tx, write_rx) = mpsc::channel();
+        let (_wake_rx, wake_tx) = tcp_stream_pair().unwrap();
+        let tunnel = TcpTunnel {
+            incoming_rx: Mutex::new(incoming_rx),
+            write_tx,
+            wake_tx: Mutex::new(wake_tx),
+            read_buf: Mutex::new(VecDeque::new()),
+            closed: AtomicBool::new(false),
+            worker: Mutex::new(None),
+        };
+
+        let mut first = [0u8; 3];
+        assert_eq!(tunnel.read(&mut first).unwrap(), 3);
+        assert_eq!(first, [1, 2, 3]);
+
+        let mut second = [0u8; 8];
+        assert_eq!(tunnel.read(&mut second).unwrap(), 2);
+        assert_eq!(&second[..2], &[4, 5]);
+
+        drop(tunnel);
+        assert!(matches!(write_rx.recv(), Ok(TcpTunnelCommand::Close)));
+    }
+
+    #[test]
+    fn distinguishes_consumed_control_frames_from_pending_input() {
+        let mut input = Cursor::new(vec![
+            0x53, 0x00, 0x00, 0x02, b'O', b'K', 0x01, 0x00, 0x00, 0x03, 1, 2, 3,
+        ]);
+        assert!(matches!(
+            read_tcp_frame(&mut input).unwrap(),
+            Some(TcpFrameRead::Control)
+        ));
+        match read_tcp_frame(&mut input).unwrap() {
+            Some(TcpFrameRead::Data(data)) => assert_eq!(data, [1, 2, 3]),
+            _ => panic!("expected data frame"),
+        }
+    }
+
+    #[test]
+    fn ignores_extension_header_and_continues_with_application_data() {
+        let mut input = Cursor::new(vec![0xaa, 0xbb, 0x01, 0x00, 0x00, 0x03, 1, 2, 3]);
+        assert!(matches!(
+            read_tcp_frame(&mut input).unwrap(),
+            Some(TcpFrameRead::Control)
+        ));
+        match read_tcp_frame(&mut input).unwrap() {
+            Some(TcpFrameRead::Data(data)) => assert_eq!(data, [1, 2, 3]),
+            _ => panic!("expected application data after extension header"),
+        }
+    }
+
+    #[test]
+    fn configures_connected_tcp_for_interactive_long_lived_streams() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        let accept = std::thread::spawn(move || listener.accept().unwrap().0);
+        let stream = configure_connected_tcp(TcpStream::connect(endpoint).unwrap()).unwrap();
+        let peer = accept.join().unwrap();
+
+        assert!(stream.nodelay().unwrap());
+        assert!(SockRef::from(&stream).keepalive().unwrap());
+        drop(peer);
     }
 }
