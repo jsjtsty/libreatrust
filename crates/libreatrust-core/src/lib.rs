@@ -1,7 +1,6 @@
 mod auth;
 mod client;
 mod error;
-mod keep_alive;
 mod proxy_service;
 mod resource;
 mod sign;
@@ -20,7 +19,6 @@ pub(crate) fn diag_log(_message: impl AsRef<str>) {}
 pub use auth::AuthSession;
 pub use client::AtrClient;
 pub use error::{AtrError, AtrResult, ErrorCode};
-pub use keep_alive::{KeepAliveConfig, KeepAliveService, KeepAliveStatus};
 pub use proxy_service::{
     ProxyService, ProxyServiceConfig, ProxyServiceEvent, ProxyServiceStats, ProxyServiceStatus,
 };

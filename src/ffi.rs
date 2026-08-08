@@ -2,10 +2,9 @@
 
 use libreatrust_core::{
     AtrClient, AtrError, AtrResult, AuthChallenge, AuthChallengeKind, AuthConfig, AuthSession,
-    CallbackTarget, ClientConfig, CookieRecord, DomainResource, ErrorCode, IpResource,
-    KeepAliveConfig, KeepAliveService, KeepAliveStatus, L3Tunnel, PasswordLoginInput, ProxyService,
-    ProxyServiceConfig, ProxyServiceEvent, ProxyServiceStatus, ResourceSnapshot, SessionMaterial,
-    SmsLoginInput, TcpTunnel, UdpTunnel, parse_resource_bytes,
+    CallbackTarget, ClientConfig, CookieRecord, DomainResource, ErrorCode, IpResource, L3Tunnel,
+    PasswordLoginInput, ProxyService, ProxyServiceConfig, ProxyServiceEvent, ProxyServiceStatus,
+    ResourceSnapshot, SessionMaterial, SmsLoginInput, TcpTunnel, UdpTunnel, parse_resource_bytes,
 };
 use std::ffi::{CStr, CString};
 use std::net::Ipv4Addr;
@@ -40,11 +39,6 @@ pub struct atr_l3_tunnel_t {
 #[repr(C)]
 pub struct atr_proxy_service_t {
     inner: ProxyService,
-}
-
-#[repr(C)]
-pub struct atr_keep_alive_service_t {
-    inner: KeepAliveService,
 }
 
 #[repr(C)]
@@ -315,20 +309,6 @@ pub struct atr_proxy_service_stats_t {
 pub struct atr_proxy_service_traffic_stats_t {
     pub managed_upload_bytes: u64,
     pub managed_download_bytes: u64,
-}
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct atr_keep_alive_config_t {
-    pub interval_ms: u64,
-    pub url: *const c_char,
-}
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct atr_keep_alive_status_t {
-    pub probe_count: u64,
-    pub last_error: *mut c_char,
 }
 
 #[repr(C)]
@@ -954,22 +934,6 @@ fn proxy_service_config_from_ffi(
     config.enable_http = input.enable_http;
     config.enable_socks5 = input.enable_socks5;
     Ok(config)
-}
-
-fn keep_alive_config_from_ffi(input: &atr_keep_alive_config_t) -> AtrResult<KeepAliveConfig> {
-    Ok(KeepAliveConfig {
-        interval_ms: if input.interval_ms == 0 {
-            KeepAliveConfig::default().interval_ms
-        } else {
-            input.interval_ms
-        },
-        url: if input.url.is_null() {
-            None
-        } else {
-            let url = cstr_to_string(input.url, "keep_alive.url")?;
-            if url.is_empty() { None } else { Some(url) }
-        },
-    })
 }
 
 fn proxy_service_status_to_ffi(status: ProxyServiceStatus) -> atr_proxy_service_status_t {
@@ -1861,6 +1825,28 @@ pub extern "C" fn atr_l3_tunnel_free(tunnel: *mut atr_l3_tunnel_t) {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn atr_l3_tunnel_close(tunnel: *const atr_l3_tunnel_t) -> i32 {
+    if tunnel.is_null() {
+        return ErrorCode::InvalidArgument as i32;
+    }
+    match unsafe { &*tunnel }.inner.close() {
+        Ok(()) => ErrorCode::Ok as i32,
+        Err(err) => store_error(&err) as i32,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn atr_l3_tunnel_send_heartbeat(tunnel: *const atr_l3_tunnel_t) -> i32 {
+    if tunnel.is_null() {
+        return ErrorCode::InvalidArgument as i32;
+    }
+    match unsafe { &*tunnel }.inner.send_heartbeat() {
+        Ok(()) => ErrorCode::Ok as i32,
+        Err(err) => store_error(&err) as i32,
+    }
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn atr_l3_tunnel_read_packet(
     tunnel: *const atr_l3_tunnel_t,
     buf: *mut u8,
@@ -1958,91 +1944,6 @@ pub extern "C" fn atr_client_start_proxy_service(
     match result {
         Ok(()) => ErrorCode::Ok as i32,
         Err(err) => store_error(&err) as i32,
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn atr_client_start_keep_alive(
-    client: *const atr_client_t,
-    config: *const atr_keep_alive_config_t,
-    out: *mut *mut atr_keep_alive_service_t,
-) -> i32 {
-    if client.is_null() || config.is_null() || out.is_null() {
-        return ErrorCode::InvalidArgument as i32;
-    }
-    let result = (|| -> Result<(), AtrError> {
-        let config = keep_alive_config_from_ffi(unsafe { &*config })?;
-        let service = KeepAliveService::start(unsafe { &*client }.inner.clone(), config)?;
-        unsafe {
-            *out = Box::into_raw(Box::new(atr_keep_alive_service_t { inner: service }));
-        }
-        Ok(())
-    })();
-    match result {
-        Ok(()) => ErrorCode::Ok as i32,
-        Err(err) => store_error(&err) as i32,
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn atr_keep_alive_stop(service: *const atr_keep_alive_service_t) -> i32 {
-    if service.is_null() {
-        return ErrorCode::InvalidArgument as i32;
-    }
-    unsafe { &*service }.inner.stop();
-    ErrorCode::Ok as i32
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn atr_keep_alive_get_status(
-    service: *const atr_keep_alive_service_t,
-    out: *mut atr_keep_alive_status_t,
-) -> i32 {
-    if service.is_null() || out.is_null() {
-        return ErrorCode::InvalidArgument as i32;
-    }
-    let status: KeepAliveStatus = unsafe { &*service }.inner.status();
-    let result = (|| -> Result<(), AtrError> {
-        let last_error = match status.last_error {
-            Some(error) => CString::new(error)
-                .map_err(|err| AtrError::Internal(err.to_string()))?
-                .into_raw(),
-            None => ptr::null_mut(),
-        };
-        unsafe {
-            *out = atr_keep_alive_status_t {
-                probe_count: status.probe_count,
-                last_error,
-            };
-        }
-        Ok(())
-    })();
-    match result {
-        Ok(()) => ErrorCode::Ok as i32,
-        Err(err) => store_error(&err) as i32,
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn atr_keep_alive_status_free(status: *mut atr_keep_alive_status_t) {
-    if status.is_null() {
-        return;
-    }
-    unsafe {
-        if !(*status).last_error.is_null() {
-            let _ = CString::from_raw((*status).last_error);
-        }
-        (*status).last_error = ptr::null_mut();
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn atr_keep_alive_free(service: *mut atr_keep_alive_service_t) {
-    if service.is_null() {
-        return;
-    }
-    unsafe {
-        drop(Box::from_raw(service));
     }
 }
 

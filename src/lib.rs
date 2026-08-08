@@ -1,10 +1,9 @@
 pub use libreatrust_core::{
     AtrClient, AtrError, AtrResult, AuthChallenge, AuthChallengeKind, AuthConfig, AuthMethodInfo,
     AuthSession, CallbackTarget, ClientConfig, CookieRecord, DomainResource, ErrorCode, IpResource,
-    KeepAliveConfig, KeepAliveService, KeepAliveStatus, L3Tunnel, PasswordLoginInput, ProtocolKind,
-    ProxyService, ProxyServiceConfig, ProxyServiceEvent, ProxyServiceStats, ProxyServiceStatus,
-    ResourceSnapshot, RouteDecision, RouteHit, SessionMaterial, SmsLoginInput, TcpTunnel,
-    UdpTunnel, parse_resource_bytes,
+    L3Tunnel, PasswordLoginInput, ProtocolKind, ProxyService, ProxyServiceConfig,
+    ProxyServiceEvent, ProxyServiceStats, ProxyServiceStatus, ResourceSnapshot, RouteDecision,
+    RouteHit, SessionMaterial, SmsLoginInput, TcpTunnel, UdpTunnel, parse_resource_bytes,
 };
 
 mod ffi;

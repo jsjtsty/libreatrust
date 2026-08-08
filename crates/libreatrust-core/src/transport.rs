@@ -1355,6 +1355,16 @@ impl L3Tunnel {
         }
     }
 
+    pub fn send_heartbeat(&self) -> AtrResult<()> {
+        let node_group_id = self
+            .client
+            .resource()
+            .map(|resource| resource.major_node_group.clone())
+            .ok_or_else(|| AtrError::InvalidState("resource not set".into()))?;
+        let remote = self.remote_for(&node_group_id)?;
+        remote.send_heartbeat()
+    }
+
     pub fn write_packet(&self, packet: &[u8]) -> AtrResult<usize> {
         let meta = parse_packet_meta(packet)?;
         let decision = match meta.protocol {
@@ -1791,6 +1801,20 @@ impl L3Remote {
         };
         self.write_interest.fetch_sub(1, Ordering::SeqCst);
         write_result?;
+        Ok(())
+    }
+
+    fn send_heartbeat(&self) -> AtrResult<()> {
+        self.write_interest.fetch_add(1, Ordering::SeqCst);
+        let write_result = {
+            let mut stream = self.stream.lock().unwrap();
+            stream
+                .write_all(&[0x05, 0x15, 0x00, 0x00])
+                .and_then(|_| stream.flush())
+        };
+        self.write_interest.fetch_sub(1, Ordering::SeqCst);
+        write_result?;
+        crate::diag_log("[libreatrust][l3] keep-alive heartbeat sent".to_string());
         Ok(())
     }
 
