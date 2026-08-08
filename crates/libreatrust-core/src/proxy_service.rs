@@ -48,6 +48,8 @@ pub struct ProxyService {
     stop: Arc<AtomicBool>,
     active_connections: Arc<AtomicU64>,
     total_connections: Arc<AtomicU64>,
+    managed_upload_bytes: Arc<AtomicU64>,
+    managed_download_bytes: Arc<AtomicU64>,
     last_error: Arc<Mutex<Option<String>>>,
     last_event: Arc<Mutex<Option<ProxyServiceEvent>>>,
     worker: Mutex<Option<thread::JoinHandle<()>>>,
@@ -69,6 +71,8 @@ impl ProxyService {
         let stop = Arc::new(AtomicBool::new(false));
         let active_connections = Arc::new(AtomicU64::new(0));
         let total_connections = Arc::new(AtomicU64::new(0));
+        let managed_upload_bytes = Arc::new(AtomicU64::new(0));
+        let managed_download_bytes = Arc::new(AtomicU64::new(0));
         let last_error = Arc::new(Mutex::new(None));
         let last_event = Arc::new(Mutex::new(None));
         let connections = Arc::new(Mutex::new(Vec::new()));
@@ -77,6 +81,8 @@ impl ProxyService {
         let worker_stop = stop.clone();
         let worker_active = active_connections.clone();
         let worker_total = total_connections.clone();
+        let worker_upload = managed_upload_bytes.clone();
+        let worker_download = managed_download_bytes.clone();
         let worker_error = last_error.clone();
         let worker_event = last_event.clone();
         let worker_connections = connections.clone();
@@ -91,6 +97,8 @@ impl ProxyService {
                     worker_stop,
                     worker_active,
                     worker_total,
+                    worker_upload,
+                    worker_download,
                     worker_error,
                     worker_event,
                     worker_connections,
@@ -104,6 +112,8 @@ impl ProxyService {
             stop,
             active_connections,
             total_connections,
+            managed_upload_bytes,
+            managed_download_bytes,
             last_error,
             last_event,
             worker: Mutex::new(Some(worker)),
@@ -144,6 +154,8 @@ impl ProxyService {
         ProxyServiceStats {
             active_connections: self.active_connections.load(Ordering::Relaxed),
             total_connections: self.total_connections.load(Ordering::Relaxed),
+            managed_upload_bytes: self.managed_upload_bytes.load(Ordering::Relaxed),
+            managed_download_bytes: self.managed_download_bytes.load(Ordering::Relaxed),
             last_error: self.last_error.lock().unwrap().clone(),
             last_event: self.last_event.lock().unwrap().clone(),
         }
@@ -164,6 +176,8 @@ impl Drop for ProxyService {
 pub struct ProxyServiceStats {
     pub active_connections: u64,
     pub total_connections: u64,
+    pub managed_upload_bytes: u64,
+    pub managed_download_bytes: u64,
     pub last_error: Option<String>,
     pub last_event: Option<ProxyServiceEvent>,
 }
@@ -181,6 +195,8 @@ fn run_listener(
     stop: Arc<AtomicBool>,
     active_connections: Arc<AtomicU64>,
     total_connections: Arc<AtomicU64>,
+    managed_upload_bytes: Arc<AtomicU64>,
+    managed_download_bytes: Arc<AtomicU64>,
     last_error: Arc<Mutex<Option<String>>>,
     last_event: Arc<Mutex<Option<ProxyServiceEvent>>>,
     connections: Arc<Mutex<Vec<thread::JoinHandle<()>>>>,
@@ -198,6 +214,8 @@ fn run_listener(
                 let error_slot = last_error.clone();
                 let event_slot = last_event.clone();
                 let socket_map = active_sockets.clone();
+                let upload = managed_upload_bytes.clone();
+                let download = managed_download_bytes.clone();
                 let connection_id = total_connections.fetch_add(1, Ordering::Relaxed) + 1;
                 if let Ok(socket) = stream.try_clone() {
                     active_sockets.lock().unwrap().insert(connection_id, socket);
@@ -207,7 +225,9 @@ fn run_listener(
                 let connection = thread::Builder::new()
                     .name("libreatrust-proxy-conn".into())
                     .spawn(move || {
-                        if let Err(err) = handle_connection(stream, client, config) {
+                        if let Err(err) =
+                            handle_connection(stream, client, config, upload, download)
+                        {
                             crate::diag_log(format!(
                                 "[libreatrust][proxy] connection failed: {err}"
                             ));
@@ -260,6 +280,8 @@ fn handle_connection(
     mut client_stream: TcpStream,
     client: AtrClient,
     config: ProxyServiceConfig,
+    managed_upload_bytes: Arc<AtomicU64>,
+    managed_download_bytes: Arc<AtomicU64>,
 ) -> AtrResult<()> {
     client_stream.set_nodelay(true)?;
     if config.idle_timeout_ms > 0 {
@@ -274,8 +296,22 @@ fn handle_connection(
     }
 
     match first[0] {
-        0x05 if config.enable_socks5 => handle_socks5(client_stream, first, client, config),
-        _ if config.enable_http => handle_http(client_stream, first, client, config),
+        0x05 if config.enable_socks5 => handle_socks5(
+            client_stream,
+            first,
+            client,
+            config,
+            managed_upload_bytes,
+            managed_download_bytes,
+        ),
+        _ if config.enable_http => handle_http(
+            client_stream,
+            first,
+            client,
+            config,
+            managed_upload_bytes,
+            managed_download_bytes,
+        ),
         _ => Err(AtrError::InvalidArgument(
             "unsupported proxy protocol".into(),
         )),
@@ -287,6 +323,8 @@ fn handle_socks5(
     mut buffer: Vec<u8>,
     client: AtrClient,
     config: ProxyServiceConfig,
+    managed_upload_bytes: Arc<AtomicU64>,
+    managed_download_bytes: Arc<AtomicU64>,
 ) -> AtrResult<()> {
     while parse_socks5_greeting(&buffer)?.is_none() {
         append_read(&mut client_stream, &mut buffer)?;
@@ -322,8 +360,17 @@ fn handle_socks5(
             client_stream.flush()?;
             if !request.leftover.is_empty() {
                 remote.write_all(&request.leftover)?;
+                if matches!(remote, ProxyRemote::Managed(_)) {
+                    managed_upload_bytes
+                        .fetch_add(request.leftover.len() as u64, Ordering::Relaxed);
+                }
             }
-            relay(client_stream, remote)
+            relay(
+                client_stream,
+                remote,
+                managed_upload_bytes,
+                managed_download_bytes,
+            )
         }
         Err(err) => {
             let _ = client_stream.write_all(&socks5_reply(0x01));
@@ -338,6 +385,8 @@ fn handle_http(
     mut buffer: Vec<u8>,
     client: AtrClient,
     config: ProxyServiceConfig,
+    managed_upload_bytes: Arc<AtomicU64>,
+    managed_download_bytes: Arc<AtomicU64>,
 ) -> AtrResult<()> {
     while find_header_end(&buffer).is_none() {
         append_read(&mut client_stream, &mut buffer)?;
@@ -362,8 +411,17 @@ fn handle_http(
                 client_stream.flush()?;
                 if !request.body.is_empty() {
                     remote.write_all(&request.body)?;
+                    if matches!(remote, ProxyRemote::Managed(_)) {
+                        managed_upload_bytes
+                            .fetch_add(request.body.len() as u64, Ordering::Relaxed);
+                    }
                 }
-                relay(client_stream, remote)
+                relay(
+                    client_stream,
+                    remote,
+                    managed_upload_bytes,
+                    managed_download_bytes,
+                )
             }
             Err(err) => {
                 let _ = client_stream.write_all(
@@ -381,8 +439,16 @@ fn handle_http(
         ));
         let remote = open_proxy_target(&client, &host, port, &config)?;
         remote.write_all(&rewritten)?;
+        if matches!(remote, ProxyRemote::Managed(_)) {
+            managed_upload_bytes.fetch_add(rewritten.len() as u64, Ordering::Relaxed);
+        }
         remote.flush()?;
-        relay(client_stream, remote)
+        relay(
+            client_stream,
+            remote,
+            managed_upload_bytes,
+            managed_download_bytes,
+        )
     }
 }
 
@@ -510,7 +576,12 @@ impl ProxyRemote {
     }
 }
 
-fn relay(client_stream: TcpStream, remote: ProxyRemote) -> AtrResult<()> {
+fn relay(
+    client_stream: TcpStream,
+    remote: ProxyRemote,
+    managed_upload_bytes: Arc<AtomicU64>,
+    managed_download_bytes: Arc<AtomicU64>,
+) -> AtrResult<()> {
     let client_reader = client_stream.try_clone()?;
     let client_writer = client_stream;
     match remote {
@@ -557,7 +628,11 @@ fn relay(client_stream: TcpStream, remote: ProxyRemote) -> AtrResult<()> {
             let client_shutdown = client_writer.try_clone()?;
             let tunnel_shutdown = tunnel.clone();
             let upstream = thread::spawn(move || {
-                let result = copy_tcp_to_tunnel(client_reader, tunnel_writer.as_ref());
+                let result = copy_tcp_to_tunnel(
+                    client_reader,
+                    tunnel_writer.as_ref(),
+                    managed_upload_bytes.as_ref(),
+                );
                 if let Err(err) = &result {
                     crate::diag_log(format!(
                         "[libreatrust][proxy] relay managed client->tunnel failed: {err}"
@@ -567,7 +642,11 @@ fn relay(client_stream: TcpStream, remote: ProxyRemote) -> AtrResult<()> {
                 result
             });
             let downstream = thread::spawn(move || {
-                let result = copy_tunnel_to_tcp(tunnel.as_ref(), client_writer);
+                let result = copy_tunnel_to_tcp(
+                    tunnel.as_ref(),
+                    client_writer,
+                    managed_download_bytes.as_ref(),
+                );
                 if let Err(err) = &result {
                     crate::diag_log(format!(
                         "[libreatrust][proxy] relay managed tunnel->client failed: {err}"
@@ -604,7 +683,11 @@ fn copy_tcp_to_tcp(mut reader: TcpStream, mut writer: TcpStream) -> AtrResult<()
     }
 }
 
-fn copy_tcp_to_tunnel(mut reader: TcpStream, tunnel: &TcpTunnel) -> AtrResult<()> {
+fn copy_tcp_to_tunnel(
+    mut reader: TcpStream,
+    tunnel: &TcpTunnel,
+    byte_counter: &AtomicU64,
+) -> AtrResult<()> {
     let mut buf = vec![0u8; READ_BUF_SIZE];
     loop {
         let n = match reader.read(&mut buf) {
@@ -616,11 +699,16 @@ fn copy_tcp_to_tunnel(mut reader: TcpStream, tunnel: &TcpTunnel) -> AtrResult<()
             Err(err) if err.kind() == ErrorKind::Interrupted => continue,
             Err(err) => return Err(AtrError::from(err)),
         };
-        tunnel.write(&buf[..n])?;
+        let written = tunnel.write(&buf[..n])?;
+        byte_counter.fetch_add(written as u64, Ordering::Relaxed);
     }
 }
 
-fn copy_tunnel_to_tcp(tunnel: &TcpTunnel, mut writer: TcpStream) -> AtrResult<()> {
+fn copy_tunnel_to_tcp(
+    tunnel: &TcpTunnel,
+    mut writer: TcpStream,
+    byte_counter: &AtomicU64,
+) -> AtrResult<()> {
     let mut buf = vec![0u8; READ_BUF_SIZE];
     loop {
         let n = tunnel.read(&mut buf)?;
@@ -629,6 +717,7 @@ fn copy_tunnel_to_tcp(tunnel: &TcpTunnel, mut writer: TcpStream) -> AtrResult<()
             return Ok(());
         }
         writer.write_all(&buf[..n])?;
+        byte_counter.fetch_add(n as u64, Ordering::Relaxed);
     }
 }
 

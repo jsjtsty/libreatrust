@@ -312,6 +312,13 @@ pub struct atr_proxy_service_stats_t {
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
+pub struct atr_proxy_service_traffic_stats_t {
+    pub managed_upload_bytes: u64,
+    pub managed_download_bytes: u64,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
 pub struct atr_keep_alive_config_t {
     pub interval_ms: u64,
     pub url: *const c_char,
@@ -2122,6 +2129,24 @@ pub extern "C" fn atr_proxy_service_get_stats(
         Ok(()) => ErrorCode::Ok as i32,
         Err(err) => store_error(&err) as i32,
     }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn atr_proxy_service_get_traffic_stats(
+    service: *const atr_proxy_service_t,
+    out: *mut atr_proxy_service_traffic_stats_t,
+) -> i32 {
+    if service.is_null() || out.is_null() {
+        return ErrorCode::InvalidArgument as i32;
+    }
+    let stats = unsafe { &*service }.inner.stats();
+    unsafe {
+        *out = atr_proxy_service_traffic_stats_t {
+            managed_upload_bytes: stats.managed_upload_bytes,
+            managed_download_bytes: stats.managed_download_bytes,
+        };
+    }
+    ErrorCode::Ok as i32
 }
 
 #[unsafe(no_mangle)]

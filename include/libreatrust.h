@@ -234,6 +234,11 @@ typedef struct atr_proxy_service_stats_t {
     char *last_event_message;
 } atr_proxy_service_stats_t;
 
+typedef struct atr_proxy_service_traffic_stats_t {
+    uint64_t managed_upload_bytes;
+    uint64_t managed_download_bytes;
+} atr_proxy_service_traffic_stats_t;
+
 typedef struct atr_keep_alive_config_t {
     uint64_t interval_ms;
     const char *url;
@@ -303,6 +308,7 @@ int atr_proxy_service_stop(const atr_proxy_service_t *service);
 int atr_proxy_service_status(const atr_proxy_service_t *service, atr_proxy_service_status_t *out);
 int atr_proxy_service_get_endpoint(const atr_proxy_service_t *service, atr_proxy_service_endpoint_t *out);
 int atr_proxy_service_get_stats(const atr_proxy_service_t *service, atr_proxy_service_stats_t *out);
+int atr_proxy_service_get_traffic_stats(const atr_proxy_service_t *service, atr_proxy_service_traffic_stats_t *out);
 int atr_proxy_service_take_event(const atr_proxy_service_t *service, atr_proxy_service_event_kind_t *out_kind, char **out_message);
 void atr_proxy_service_endpoint_free(atr_proxy_service_endpoint_t *endpoint);
 void atr_proxy_service_stats_free(atr_proxy_service_stats_t *stats);
