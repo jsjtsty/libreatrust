@@ -5,7 +5,7 @@ use rustls::pki_types::ServerName;
 use rustls::{ClientConnection, StreamOwned};
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 use url::Url;
@@ -126,10 +126,102 @@ fn probe_dns(client: &AtrClient) -> AtrResult<()> {
         .resource()
         .and_then(|resource| resource.dns_server.clone())
         .ok_or_else(|| AtrError::NotFound("remote DNS server is not configured".into()))?;
-    let tunnel = client.open_udp_tunnel(&dns_server, 53)?;
     let packet = build_dns_query(0x4c41);
-    tunnel.write(&packet)?;
-    tunnel.close()
+    match probe_dns_udp(client, &dns_server, &packet) {
+        Ok(()) => Ok(()),
+        Err(udp_err) => {
+            crate::diag_log(format!("[libreatrust][keep-alive] UDP DNS probe failed, trying TCP: {udp_err}"));
+            probe_dns_tcp(client, &dns_server, &packet).map_err(|tcp_err| {
+                AtrError::NetworkFailed(format!("DNS keep-alive failed over UDP ({udp_err}) and TCP ({tcp_err})"))
+            })
+        }
+    }
+}
+
+fn probe_dns_udp(client: &AtrClient, dns_server: &str, packet: &[u8]) -> AtrResult<()> {
+    let tunnel = Arc::new(client.open_udp_tunnel(dns_server, 53)?);
+    tunnel.write(packet)?;
+    let response = read_udp_with_timeout(tunnel.clone(), 10_000)?;
+    tunnel.close()?;
+    validate_dns_response(packet, &response)
+}
+
+fn probe_dns_tcp(client: &AtrClient, dns_server: &str, packet: &[u8]) -> AtrResult<()> {
+    let tunnel = Arc::new(client.open_tcp_tunnel(dns_server, 53)?);
+    let framed_len = u16::try_from(packet.len())
+        .map_err(|_| AtrError::InvalidArgument("DNS query is too large".into()))?;
+    let mut framed = Vec::with_capacity(packet.len() + 2);
+    framed.extend_from_slice(&framed_len.to_be_bytes());
+    framed.extend_from_slice(packet);
+    tunnel.write(&framed)?;
+    let response = read_tcp_dns_with_timeout(tunnel.clone(), 10_000)?;
+    tunnel.close()?;
+    validate_dns_response(packet, &response)
+}
+
+fn validate_dns_response(query: &[u8], response: &[u8]) -> AtrResult<()> {
+    if response.len() < 12 {
+        return Err(AtrError::NetworkFailed("DNS response is too short".into()));
+    }
+    if response[..2] != query[..2] {
+        return Err(AtrError::NetworkFailed("DNS response ID does not match query".into()));
+    }
+    Ok(())
+}
+
+fn read_udp_with_timeout(tunnel: Arc<crate::transport::UdpTunnel>, timeout_ms: u64) -> AtrResult<Vec<u8>> {
+    let (tx, rx) = mpsc::channel();
+    let reader_tunnel = tunnel.clone();
+    thread::spawn(move || {
+        let mut response = vec![0u8; 4096];
+        let result = reader_tunnel.read(&mut response).map(|len| {
+            response.truncate(len);
+            response
+        });
+        let _ = tx.send(result);
+    });
+    match rx.recv_timeout(Duration::from_millis(timeout_ms)) {
+        Ok(result) => result,
+        Err(_) => {
+            let _ = tunnel.close();
+            Err(AtrError::NetworkFailed(format!("DNS UDP response timed out after {timeout_ms}ms")))
+        }
+    }
+}
+
+fn read_tcp_dns_with_timeout(tunnel: Arc<TcpTunnel>, timeout_ms: u64) -> AtrResult<Vec<u8>> {
+    let (tx, rx) = mpsc::channel();
+    let reader_tunnel = tunnel.clone();
+    thread::spawn(move || {
+        let result = (|| {
+            let mut length = [0u8; 2];
+            read_tunnel_exact(&reader_tunnel, &mut length)?;
+            let response_len = u16::from_be_bytes(length) as usize;
+            let mut response = vec![0u8; response_len];
+            read_tunnel_exact(&reader_tunnel, &mut response)?;
+            Ok(response)
+        })();
+        let _ = tx.send(result);
+    });
+    match rx.recv_timeout(Duration::from_millis(timeout_ms)) {
+        Ok(result) => result,
+        Err(_) => {
+            let _ = tunnel.close();
+            Err(AtrError::NetworkFailed(format!("DNS TCP response timed out after {timeout_ms}ms")))
+        }
+    }
+}
+
+fn read_tunnel_exact(tunnel: &TcpTunnel, buffer: &mut [u8]) -> AtrResult<()> {
+    let mut offset = 0;
+    while offset < buffer.len() {
+        let count = tunnel.read(&mut buffer[offset..])?;
+        if count == 0 {
+            return Err(AtrError::NetworkFailed("TCP tunnel closed while reading DNS response".into()));
+        }
+        offset += count;
+    }
+    Ok(())
 }
 
 fn probe_http(client: &AtrClient, target: &str) -> AtrResult<()> {
@@ -141,7 +233,9 @@ fn probe_http(client: &AtrClient, target: &str) -> AtrResult<()> {
     }
     let host = url
         .host_str()
-        .ok_or_else(|| AtrError::InvalidArgument("keep-alive URL has no host".into()))?;
+        .ok_or_else(|| AtrError::InvalidArgument("keep-alive URL has no host".into()))?
+        .to_string();
+    let is_https = url.scheme() == "https";
     let port = url.port_or_known_default().unwrap_or(80);
     let path = if url.path().is_empty() {
         "/"
@@ -155,33 +249,62 @@ fn probe_http(client: &AtrClient, target: &str) -> AtrResult<()> {
     let request = format!(
         "GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nUser-Agent: libreatrust-keep-alive\r\n\r\n"
     );
-    let tunnel = client.open_tcp_tunnel(host, port)?;
-    if url.scheme() == "https" {
-        let server_name = ServerName::try_from(host.to_string())
-            .map_err(|_| AtrError::InvalidArgument(format!("invalid HTTPS host {host}")))?;
-        let conn = ClientConnection::new(client_tls_config(), server_name).map_err(|err| {
-            AtrError::NetworkFailed(format!("HTTPS handshake setup failed: {err}"))
-        })?;
-        let mut tls = StreamOwned::new(conn, TunnelIo { tunnel: &tunnel });
-        tls.write_all(request.as_bytes())?;
-        tls.flush()?;
-    } else {
-        tunnel.write(request.as_bytes())?;
+    let tunnel = Arc::new(client.open_tcp_tunnel(&host, port)?);
+    let (tx, rx) = mpsc::channel();
+    let worker_tunnel = tunnel.clone();
+    let worker = thread::spawn(move || {
+        let result = (|| -> AtrResult<()> {
+            if is_https {
+                let server_name = ServerName::try_from(host.to_string())
+                    .map_err(|_| AtrError::InvalidArgument(format!("invalid HTTPS host {host}")))?;
+                let conn = ClientConnection::new(client_tls_config(), server_name)
+                    .map_err(|err| AtrError::NetworkFailed(format!("HTTPS handshake setup failed: {err}")))?;
+                let mut tls = StreamOwned::new(conn, TunnelIo { tunnel: worker_tunnel.clone() });
+                tls.write_all(request.as_bytes())?;
+                tls.flush()?;
+                let mut response = [0u8; 1024];
+                let count = tls.read(&mut response)?;
+                validate_http_response(&response[..count])
+            } else {
+                worker_tunnel.write(request.as_bytes())?;
+                let mut response = [0u8; 1024];
+                let count = worker_tunnel.read(&mut response)?;
+                validate_http_response(&response[..count])
+            }
+        })();
+        let _ = tx.send(result);
+    });
+    let result = match rx.recv_timeout(Duration::from_millis(10_000)) {
+        Ok(result) => result,
+        Err(_) => Err(AtrError::NetworkFailed("HTTP keep-alive response timed out after 10000ms".into())),
+    };
+    if result.is_err() {
+        let _ = tunnel.close();
     }
-    tunnel.close()
+    let _ = worker.join();
+    result
 }
 
-struct TunnelIo<'a> {
-    tunnel: &'a TcpTunnel,
+fn validate_http_response(response: &[u8]) -> AtrResult<()> {
+    let header = String::from_utf8_lossy(response);
+    if header.starts_with("HTTP/") {
+        Ok(())
+    } else {
+        Err(AtrError::NetworkFailed("HTTP keep-alive returned an invalid response".into()))
+    }
 }
 
-impl Read for TunnelIo<'_> {
+struct TunnelIo {
+    tunnel: Arc<TcpTunnel>,
+}
+
+impl Read for TunnelIo {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         self.tunnel.read(buf).map_err(std::io::Error::other)
     }
 }
 
-impl Write for TunnelIo<'_> {
+impl Write for TunnelIo {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.tunnel.write(buf).map_err(std::io::Error::other)
     }
