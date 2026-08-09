@@ -296,8 +296,7 @@ fn match_domain(
     let host = host.trim_end_matches('.').to_ascii_lowercase();
     for (domain, resource) in &snapshot.domain_resources {
         if !protocol_matches(&resource.protocol, protocol)
-            || resource.port_min > port
-            || port > resource.port_max
+            || !ports_match(resource.port_min, resource.port_max, port, protocol)
         {
             continue;
         }
@@ -331,8 +330,7 @@ fn match_ip(
     for resource in &snapshot.ip_resources {
         if ip_between(ip, resource.ip_min, resource.ip_max)
             && protocol_matches(&resource.protocol, protocol)
-            && resource.port_min <= port
-            && port <= resource.port_max
+            && ports_match(resource.port_min, resource.port_max, port, protocol)
         {
             return Some(RouteHit {
                 app_id: resource.app_id.clone(),
@@ -341,6 +339,16 @@ fn match_ip(
         }
     }
     None
+}
+
+/// ICMP has no transport-layer ports. Resource entries still carry a port
+/// range because the server uses one common address-resource representation
+/// for TCP, UDP, and ICMP, so the range must not constrain ICMP routing.
+fn ports_match(port_min: u16, port_max: u16, port: u16, protocol: ProtocolKind) -> bool {
+    match protocol {
+        ProtocolKind::Icmp => true,
+        ProtocolKind::Tcp | ProtocolKind::Udp => port_min <= port && port <= port_max,
+    }
 }
 
 fn protocol_matches(rule: &str, protocol: ProtocolKind) -> bool {
@@ -484,6 +492,42 @@ mod tests {
         });
         let hit = route(&snapshot, "10.0.0.2", 80, ProtocolKind::Tcp);
         assert!(matches!(hit, RouteDecision::Managed(_)));
+    }
+
+    #[test]
+    fn routes_icmp_without_a_port() {
+        let mut snapshot = ResourceSnapshot::default();
+        snapshot.ip_resources.push(IpResource {
+            ip_min: "192.168.57.47".parse().unwrap(),
+            ip_max: "192.168.244.254".parse().unwrap(),
+            port_min: 1,
+            port_max: u16::MAX,
+            protocol: "all".into(),
+            app_id: "app".into(),
+            node_group_id: "group".into(),
+        });
+
+        let hit = route(&snapshot, "192.168.57.47", 0, ProtocolKind::Icmp);
+        assert!(matches!(hit, RouteDecision::Managed(_)));
+    }
+
+    #[test]
+    fn ports_still_constrain_tcp_and_udp() {
+        let mut snapshot = ResourceSnapshot::default();
+        snapshot.ip_resources.push(IpResource {
+            ip_min: "10.0.0.1".parse().unwrap(),
+            ip_max: "10.0.0.10".parse().unwrap(),
+            port_min: 443,
+            port_max: 443,
+            protocol: "all".into(),
+            app_id: "app".into(),
+            node_group_id: "group".into(),
+        });
+
+        let tcp = route(&snapshot, "10.0.0.2", 80, ProtocolKind::Tcp);
+        let udp = route(&snapshot, "10.0.0.2", 80, ProtocolKind::Udp);
+        assert!(matches!(tcp, RouteDecision::Direct));
+        assert!(matches!(udp, RouteDecision::Direct));
     }
 
     #[test]

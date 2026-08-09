@@ -7,13 +7,37 @@ mod sign;
 mod transport;
 mod types;
 
-#[cfg(any(debug_assertions, feature = "verbose-logs"))]
+#[cfg(feature = "verbose-logs")]
 pub(crate) fn diag_log(message: impl AsRef<str>) {
     let message = message.as_ref();
     eprintln!("{message}");
+
+    let log_path = std::env::var_os("HOME")
+        .filter(|home| home != "/var/root")
+        .map(|home| {
+            std::path::PathBuf::from(home)
+                .join("Library/Application Support/NulConnect/NulConnect.log")
+        })
+        .unwrap_or_else(|| {
+            std::path::PathBuf::from(
+                "/Library/Application Support/NulConnect/nulconnect-helper.log",
+            )
+        });
+
+    if let Some(parent) = log_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+    {
+        use std::io::Write as _;
+        let _ = writeln!(file, "{message}");
+    }
 }
 
-#[cfg(not(any(debug_assertions, feature = "verbose-logs")))]
+#[cfg(not(feature = "verbose-logs"))]
 pub(crate) fn diag_log(_message: impl AsRef<str>) {}
 
 pub use auth::AuthSession;

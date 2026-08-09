@@ -54,6 +54,7 @@ pub struct UdpTunnel {
 const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(15);
 const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 const TCP_KEEPALIVE_RETRIES: u32 = 3;
+const L3_BUSINESS_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(300);
 
 impl TcpTunnel {
     pub fn connect(client: &AtrClient, host: &str, port: u16) -> AtrResult<Self> {
@@ -1314,9 +1315,15 @@ impl Drop for UdpTunnel {
 
 #[derive(Debug)]
 pub struct L3Tunnel {
+    state: Arc<L3TunnelState>,
+    incoming_rx: Mutex<mpsc::Receiver<Vec<u8>>>,
+    business_keepalive_worker: Mutex<Option<thread::JoinHandle<()>>>,
+}
+
+#[derive(Debug)]
+struct L3TunnelState {
     client: AtrClient,
     incoming_tx: mpsc::Sender<Vec<u8>>,
-    incoming_rx: Mutex<mpsc::Receiver<Vec<u8>>>,
     remotes: Mutex<HashMap<String, Arc<L3Remote>>>,
     close_flag: Arc<AtomicBool>,
     vip_list: Arc<Mutex<Vec<Ipv4Addr>>>,
@@ -1325,19 +1332,28 @@ pub struct L3Tunnel {
 impl L3Tunnel {
     pub fn new(client: AtrClient) -> AtrResult<Self> {
         let (tx, rx) = mpsc::channel();
-        Ok(Self {
+        let state = Arc::new(L3TunnelState {
             client,
             incoming_tx: tx,
-            incoming_rx: Mutex::new(rx),
             remotes: Mutex::new(HashMap::new()),
             close_flag: Arc::new(AtomicBool::new(false)),
             vip_list: Arc::new(Mutex::new(Vec::new())),
+        });
+        let worker_state = state.clone();
+        let worker = thread::Builder::new()
+            .name("libreatrust-l3-business-keepalive".into())
+            .spawn(move || business_keepalive_loop(worker_state))
+            .map_err(|err| AtrError::Internal(format!("failed to spawn L3 business keepalive: {err}")))?;
+        Ok(Self {
+            state,
+            incoming_rx: Mutex::new(rx),
+            business_keepalive_worker: Mutex::new(Some(worker)),
         })
     }
 
     pub fn read_packet(&self) -> AtrResult<Vec<u8>> {
         loop {
-            if self.close_flag.load(Ordering::SeqCst) {
+            if self.state.close_flag.load(Ordering::SeqCst) {
                 return Err(AtrError::NetworkFailed("l3 tunnel closed".into()));
             }
             match self
@@ -1357,11 +1373,12 @@ impl L3Tunnel {
 
     pub fn send_heartbeat(&self) -> AtrResult<()> {
         let node_group_id = self
+            .state
             .client
             .resource()
             .map(|resource| resource.major_node_group.clone())
             .ok_or_else(|| AtrError::InvalidState("resource not set".into()))?;
-        let remote = self.remote_for(&node_group_id)?;
+        let remote = self.state.remote_for(&node_group_id)?;
         remote.send_heartbeat()
     }
 
@@ -1369,12 +1386,14 @@ impl L3Tunnel {
         let meta = parse_packet_meta(packet)?;
         let decision = match meta.protocol {
             ProtocolKind::Tcp => self
+                .state
                 .client
                 .route_tcp(&meta.dst_ip.to_string(), meta.dst_port),
             ProtocolKind::Udp => self
+                .state
                 .client
                 .route_udp(&meta.dst_ip.to_string(), meta.dst_port),
-            ProtocolKind::Icmp => self.client.route_icmp(&meta.dst_ip.to_string()),
+            ProtocolKind::Icmp => self.state.client.route_icmp(&meta.dst_ip.to_string()),
         };
         let hit = match decision {
             RouteDecision::Managed(hit) => hit,
@@ -1386,16 +1405,21 @@ impl L3Tunnel {
             }
         };
 
-        let remote = self.remote_for(&hit.node_group_id)?;
+        let remote = self.state.remote_for(&hit.node_group_id)?;
         remote.write_packet(meta, &hit.app_id, &hit.node_group_id, packet)?;
         Ok(packet.len())
     }
 
     pub fn close(&self) -> AtrResult<()> {
-        if self.close_flag.swap(true, Ordering::SeqCst) {
+        if self.state.close_flag.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
+        crate::diag_log("[libreatrust][l3] tunnel close requested".to_string());
+        if let Some(worker) = self.business_keepalive_worker.lock().unwrap().take() {
+            let _ = worker.join();
+        }
         let remotes: Vec<_> = self
+            .state
             .remotes
             .lock()
             .unwrap()
@@ -1405,13 +1429,17 @@ impl L3Tunnel {
         for remote in remotes {
             remote.close();
         }
+        crate::diag_log("[libreatrust][l3] tunnel close completed".to_string());
         Ok(())
     }
 
     pub fn virtual_ips(&self) -> Vec<Ipv4Addr> {
-        self.vip_list.lock().unwrap().clone()
+        self.state.vip_list.lock().unwrap().clone()
     }
 
+}
+
+impl L3TunnelState {
     fn remote_for(&self, node_group_id: &str) -> AtrResult<Arc<L3Remote>> {
         if self.close_flag.load(Ordering::SeqCst) {
             return Err(AtrError::InvalidState("l3 tunnel closed".into()));
@@ -1421,6 +1449,9 @@ impl L3Tunnel {
             if !existing.close_flag.load(Ordering::SeqCst) {
                 return Ok(existing);
             }
+            crate::diag_log(format!(
+                "[libreatrust][l3] replacing closed remote node_group={node_group_id}"
+            ));
             self.remotes.lock().unwrap().remove(node_group_id);
             existing.close();
         }
@@ -1452,6 +1483,175 @@ impl L3Tunnel {
         ));
         Ok(remote)
     }
+}
+
+fn business_keepalive_loop(state: Arc<L3TunnelState>) {
+    let Some(node_group_id) = state
+        .client
+        .resource()
+        .map(|resource| resource.major_node_group.clone())
+    else {
+        crate::diag_log(
+            "[libreatrust][l3] business keepalive disabled: resource not set".to_string(),
+        );
+        return;
+    };
+
+    if let Err(error) = state
+        .remote_for(&node_group_id)
+        .and_then(|remote| remote.send_heartbeat())
+    {
+        crate::diag_log(format!(
+            "[libreatrust][l3] business keepalive could not establish L3 session error={error}"
+        ));
+        return;
+    }
+
+    let Some(target) = select_icmp_keepalive_target(&state.client) else {
+        crate::diag_log(
+            "[libreatrust][l3] business keepalive disabled: no managed IPv4 ICMP target"
+                .to_string(),
+        );
+        return;
+    };
+
+    crate::diag_log(format!(
+        "[libreatrust][l3] business keepalive started target={target} interval_secs={}",
+        L3_BUSINESS_KEEPALIVE_INTERVAL.as_secs()
+    ));
+
+    let mut sequence = 0u16;
+    while !state.close_flag.load(Ordering::SeqCst) {
+        match send_icmp_keepalive(&state, target, sequence) {
+            Ok(()) => crate::diag_log(format!(
+                "[libreatrust][l3] business keepalive sent target={target} sequence={sequence}"
+            )),
+            Err(error) => crate::diag_log(format!(
+                "[libreatrust][l3] business keepalive failed target={target} sequence={sequence} error={error}"
+            )),
+        }
+        sequence = sequence.wrapping_add(1);
+        sleep_until_keepalive(&state.close_flag, L3_BUSINESS_KEEPALIVE_INTERVAL);
+    }
+    crate::diag_log("[libreatrust][l3] business keepalive stopped".to_string());
+}
+
+fn send_icmp_keepalive(
+    state: &L3TunnelState,
+    destination: Ipv4Addr,
+    sequence: u16,
+) -> AtrResult<()> {
+    let node_group_id = state
+        .client
+        .resource()
+        .ok_or_else(|| AtrError::InvalidState("resource not set".into()))?
+        .major_node_group
+        .clone();
+    let remote = state.remote_for(&node_group_id)?;
+    remote.send_heartbeat()?;
+    let source = state
+        .vip_list
+        .lock()
+        .unwrap()
+        .first()
+        .copied()
+        .ok_or_else(|| AtrError::InvalidState("L3 virtual IP is not available".into()))?;
+    let packet = build_icmp_echo_packet(source, destination, sequence);
+    let hit = match state.client.route_icmp(&destination.to_string()) {
+        RouteDecision::Managed(hit) => hit,
+        RouteDecision::Direct => {
+            return Err(AtrError::NotFound(format!(
+                "resource not managed for {destination}"
+            )));
+        }
+    };
+    let remote = state.remote_for(&hit.node_group_id)?;
+    remote.write_packet(
+        parse_packet_meta(&packet)?,
+        &hit.app_id,
+        &hit.node_group_id,
+        &packet,
+    )?;
+    crate::diag_log(format!(
+        "[libreatrust][l3] business keepalive packet source={source} target={destination} bytes={}",
+        packet.len()
+    ));
+    Ok(())
+}
+
+fn sleep_until_keepalive(close_flag: &AtomicBool, duration: Duration) {
+    let mut remaining = duration;
+    while remaining > Duration::ZERO && !close_flag.load(Ordering::SeqCst) {
+        let step = remaining.min(Duration::from_secs(1));
+        thread::sleep(step);
+        remaining = remaining.saturating_sub(step);
+    }
+}
+
+fn select_icmp_keepalive_target(client: &AtrClient) -> Option<Ipv4Addr> {
+    let resource = client.resource()?;
+    for (domain, ip) in &resource.dns_resource {
+        let Some(domain_resource) = resource.domain_resources.get(domain) else {
+            continue;
+        };
+        if !protocol_allows_icmp(&domain_resource.protocol) {
+            continue;
+        }
+        if matches!(client.route_icmp(&ip.to_string()), RouteDecision::Managed(_)) {
+            return Some(*ip);
+        }
+    }
+
+    for ip_resource in &resource.ip_resources {
+        if !protocol_allows_icmp(&ip_resource.protocol) {
+            continue;
+        }
+        let candidate = representative_ipv4(ip_resource.ip_min, ip_resource.ip_max)?;
+        if matches!(client.route_icmp(&candidate.to_string()), RouteDecision::Managed(_)) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn protocol_allows_icmp(protocol: &str) -> bool {
+    matches!(protocol, "icmp" | "all")
+}
+
+fn representative_ipv4(min: Ipv4Addr, max: Ipv4Addr) -> Option<Ipv4Addr> {
+    let min = u32::from_be_bytes(min.octets());
+    let max = u32::from_be_bytes(max.octets());
+    if min > max {
+        return None;
+    }
+    let mut candidate = min + (max - min) / 2;
+    if min < max && matches!(candidate & 0xff, 0 | 255) {
+        candidate = candidate.saturating_add(1).min(max);
+    }
+    Some(Ipv4Addr::from(candidate))
+}
+
+fn build_icmp_echo_packet(source: Ipv4Addr, destination: Ipv4Addr, sequence: u16) -> Vec<u8> {
+    let payload = b"reatrust keep-alive";
+    let icmp_len = 8 + payload.len();
+    let total_len = 20 + icmp_len;
+    let mut packet = vec![0u8; total_len];
+    packet[0] = (4 << 4) | 5;
+    packet[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
+    packet[4..6].copy_from_slice(&sequence.to_be_bytes());
+    packet[8] = 64;
+    packet[9] = 1;
+    packet[12..16].copy_from_slice(&source.octets());
+    packet[16..20].copy_from_slice(&destination.octets());
+    packet[20] = 8;
+    packet[24..26].copy_from_slice(&0x5241u16.to_be_bytes());
+    packet[26..28].copy_from_slice(&sequence.to_be_bytes());
+    packet[28..].copy_from_slice(payload);
+    let icmp_checksum = ipv4_checksum(&packet[20..]);
+    packet[22..24].copy_from_slice(&icmp_checksum.to_be_bytes());
+    let ip_checksum = ipv4_checksum(&packet[..20]);
+    packet[10..12].copy_from_slice(&ip_checksum.to_be_bytes());
+    packet
 }
 
 impl Drop for L3Tunnel {
@@ -1600,8 +1800,12 @@ impl L3Remote {
         let reader_worker = thread::Builder::new()
             .name("libreatrust-l3-reader".into())
             .spawn(move || {
+                crate::diag_log("[libreatrust][l3] reader worker started".to_string());
                 loop {
                     if close.load(Ordering::SeqCst) {
+                        crate::diag_log(
+                            "[libreatrust][l3] reader worker noticed close flag".to_string(),
+                        );
                         break;
                     }
                     if write_interest.load(Ordering::SeqCst) > 0 {
@@ -1615,7 +1819,12 @@ impl L3Remote {
                     let frame = match frame {
                         Ok(Some(v)) => v,
                         Ok(None) => continue,
-                        Err(_) => break,
+                        Err(error) => {
+                            crate::diag_log(format!(
+                                "[libreatrust][l3] reader worker frame read failed error={error}"
+                            ));
+                            break;
+                        }
                     };
                     match frame.cmd {
                         0x94 => {
@@ -1639,12 +1848,19 @@ impl L3Remote {
                         _ => {}
                     }
                 }
+                crate::diag_log(format!(
+                    "[libreatrust][l3] reader worker exiting close_flag={}",
+                    reader_close.load(Ordering::SeqCst)
+                ));
                 reader_close.store(true, Ordering::SeqCst);
                 let (closed, notify) = &*reader_notify;
                 *closed.lock().unwrap() = true;
                 notify.notify_all();
                 if let Ok(stream) = reader_stream.lock() {
-                    let _ = stream.sock.shutdown(Shutdown::Both);
+                    let result = stream.sock.shutdown(Shutdown::Both);
+                    crate::diag_log(format!(
+                        "[libreatrust][l3] reader worker socket shutdown result={result:?}"
+                    ));
                 }
             })
             .expect("failed to spawn L3 reader");
@@ -1652,6 +1868,9 @@ impl L3Remote {
         let heartbeat_worker = thread::Builder::new()
             .name("libreatrust-l3-heartbeat".into())
             .spawn(move || {
+                crate::diag_log(
+                    "[libreatrust][l3] heartbeat worker started interval_secs=25".to_string(),
+                );
                 while !heartbeat_close.load(Ordering::SeqCst) {
                     let (closed, notify) = &*close_notify;
                     let guard = closed.lock().unwrap();
@@ -1660,14 +1879,30 @@ impl L3Remote {
                     }
                     let (guard, _) = notify.wait_timeout(guard, Duration::from_secs(25)).unwrap();
                     if *guard || heartbeat_close.load(Ordering::SeqCst) {
+                        crate::diag_log(format!(
+                            "[libreatrust][l3] heartbeat worker stopping closed={} close_flag={}",
+                            *guard,
+                            heartbeat_close.load(Ordering::SeqCst)
+                        ));
                         break;
                     }
                     heartbeat_write_interest.fetch_add(1, Ordering::SeqCst);
                     let mut stream = heartbeat_stream.lock().unwrap();
-                    let _ = stream.write_all(&[0x05, 0x15, 0x00, 0x00]);
-                    let _ = stream.flush();
+                    let write_result = stream
+                        .write_all(&[0x05, 0x15, 0x00, 0x00])
+                        .and_then(|_| stream.flush());
                     heartbeat_write_interest.fetch_sub(1, Ordering::SeqCst);
+
+                    match write_result {
+                        Ok(()) => crate::diag_log(
+                            "[libreatrust][l3] heartbeat worker sent heartbeat".to_string(),
+                        ),
+                        Err(error) => crate::diag_log(format!(
+                            "[libreatrust][l3] heartbeat worker send failed error={error}"
+                        )),
+                    }
                 }
+                crate::diag_log("[libreatrust][l3] heartbeat worker stopped".to_string());
             })
             .expect("failed to spawn L3 heartbeat");
 
@@ -1678,17 +1913,30 @@ impl L3Remote {
     }
 
     fn close(&self) {
-        self.close_flag.store(true, Ordering::SeqCst);
+        let was_closed = self.close_flag.swap(true, Ordering::SeqCst);
+        crate::diag_log(format!(
+            "[libreatrust][l3] remote close requested already_closed={was_closed}"
+        ));
         let (closed, notify) = &*self.close_notify;
         *closed.lock().unwrap() = true;
         notify.notify_all();
         if let Ok(stream) = self.stream.lock() {
-            let _ = stream.sock.shutdown(Shutdown::Both);
+            let result = stream.sock.shutdown(Shutdown::Both);
+            crate::diag_log(format!(
+                "[libreatrust][l3] remote socket shutdown result={result:?}"
+            ));
         }
         let workers = std::mem::take(&mut *self.workers.lock().unwrap());
+        crate::diag_log(format!(
+            "[libreatrust][l3] remote joining workers count={}",
+            workers.len()
+        ));
         for worker in workers {
-            let _ = worker.join();
+            if worker.join().is_err() {
+                crate::diag_log("[libreatrust][l3] remote worker join failed".to_string());
+            }
         }
+        crate::diag_log("[libreatrust][l3] remote close completed".to_string());
     }
 
     fn auth_tunnel(&self) -> AtrResult<()> {
