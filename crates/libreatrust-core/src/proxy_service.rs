@@ -1,6 +1,6 @@
 use crate::client::AtrClient;
 use crate::error::{AtrError, AtrResult};
-use crate::transport::{TcpTunnel, connect_tcp_bound};
+use crate::transport::{connect_tcp_bound, TcpTunnel};
 use crate::types::RouteDecision;
 use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
@@ -599,7 +599,10 @@ fn relay(
                         "[libreatrust][proxy] relay direct client->remote failed: {err}"
                     ));
                 }
-                let _ = upstream_remote.shutdown(Shutdown::Write);
+                // Wake the peer-reading relay as well. Shutting down only the
+                // write half can leave ProxyService::stop waiting forever on
+                // a browser keep-alive connection.
+                let _ = upstream_remote.shutdown(Shutdown::Both);
                 let _ = upstream_client.shutdown(Shutdown::Read);
                 result
             });
@@ -926,4 +929,47 @@ fn parse_host_port(value: &str, default_port: u16) -> AtrResult<(String, u16)> {
         }
     }
     Ok((value.to_string(), default_port))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    fn connected_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        (client, server)
+    }
+
+    #[test]
+    fn direct_relay_stops_when_client_socket_is_shutdown() {
+        let (browser, proxy_client) = connected_pair();
+        let stop_socket = proxy_client.try_clone().unwrap();
+        let (proxy_remote, remote_peer) = connected_pair();
+        let (done_tx, done_rx) = mpsc::channel();
+
+        let worker = thread::spawn(move || {
+            let result = relay(
+                proxy_client,
+                ProxyRemote::Direct(proxy_remote),
+                Arc::new(AtomicU64::new(0)),
+                Arc::new(AtomicU64::new(0)),
+            );
+            let _ = done_tx.send(result);
+        });
+
+        // Keep both peers alive, just as a browser and an HTTP keep-alive
+        // server would. Proxy shutdown must still wake both relay directions.
+        let _browser = browser;
+        let _remote_peer = remote_peer;
+        stop_socket.shutdown(Shutdown::Both).unwrap();
+
+        let result = done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("direct relay did not stop after client shutdown");
+        assert!(result.is_ok());
+        worker.join().unwrap();
+    }
 }

@@ -2,9 +2,9 @@ use crate::client::AtrClient;
 use crate::error::{AtrError, AtrResult};
 use crate::sign::calc_request_sig;
 use crate::types::{ProtocolKind, RouteDecision};
-use rustls::SignatureScheme;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::SignatureScheme;
 use rustls::{ClientConfig as TlsClientConfig, ClientConnection, StreamOwned};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -15,14 +15,14 @@ use std::env;
 #[cfg(target_family = "unix")]
 use std::ffi::CStr;
 use std::fmt;
-use std::io::{ErrorKind, Read, Write};
+use std::io::{BufReader, ErrorKind, Read, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
 #[cfg(target_family = "unix")]
 use std::os::fd::FromRawFd;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, mpsc};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 #[derive(Debug)]
 pub struct TcpTunnel {
@@ -55,6 +55,8 @@ const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(15);
 const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 const TCP_KEEPALIVE_RETRIES: u32 = 3;
 const L3_BUSINESS_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(300);
+const L3_PROTOCOL_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(25);
+const L3_READ_BATCH_FRAMES: usize = 32;
 
 impl TcpTunnel {
     pub fn connect(client: &AtrClient, host: &str, port: u16) -> AtrResult<Self> {
@@ -713,7 +715,11 @@ fn route_default_physical_interface(addr: &SocketAddr) -> Option<u32> {
     }
     let c_name = std::ffi::CString::new(interface).ok()?;
     let index = unsafe { libc::if_nametoindex(c_name.as_ptr()) };
-    if index == 0 { None } else { Some(index) }
+    if index == 0 {
+        None
+    } else {
+        Some(index)
+    }
 }
 
 #[cfg(target_family = "unix")]
@@ -1230,20 +1236,18 @@ impl UdpTunnel {
             let l3_reader = l3.clone();
             let close_flag_reader = close_flag.clone();
             let tx_reader = tx.clone();
-            thread::spawn(move || {
-                loop {
-                    if close_flag_reader.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    let packet = match l3_reader.read_packet() {
-                        Ok(pkt) => pkt,
-                        Err(_) => break,
-                    };
-                    if let Some(payload) =
-                        udp_payload_if_match(&packet, local_ip, local_port, remote_ip, port)
-                    {
-                        let _ = tx_reader.send(payload);
-                    }
+            thread::spawn(move || loop {
+                if close_flag_reader.load(Ordering::SeqCst) {
+                    break;
+                }
+                let packet = match l3_reader.read_packet() {
+                    Ok(pkt) => pkt,
+                    Err(_) => break,
+                };
+                if let Some(payload) =
+                    udp_payload_if_match(&packet, local_ip, local_port, remote_ip, port)
+                {
+                    let _ = tx_reader.send(payload);
                 }
             });
         }
@@ -1325,6 +1329,7 @@ struct L3TunnelState {
     client: AtrClient,
     incoming_tx: mpsc::Sender<Vec<u8>>,
     remotes: Mutex<HashMap<String, Arc<L3Remote>>>,
+    remote_creation: Mutex<()>,
     close_flag: Arc<AtomicBool>,
     vip_list: Arc<Mutex<Vec<Ipv4Addr>>>,
 }
@@ -1336,6 +1341,7 @@ impl L3Tunnel {
             client,
             incoming_tx: tx,
             remotes: Mutex::new(HashMap::new()),
+            remote_creation: Mutex::new(()),
             close_flag: Arc::new(AtomicBool::new(false)),
             vip_list: Arc::new(Mutex::new(Vec::new())),
         });
@@ -1343,7 +1349,9 @@ impl L3Tunnel {
         let worker = thread::Builder::new()
             .name("libreatrust-l3-business-keepalive".into())
             .spawn(move || business_keepalive_loop(worker_state))
-            .map_err(|err| AtrError::Internal(format!("failed to spawn L3 business keepalive: {err}")))?;
+            .map_err(|err| {
+                AtrError::Internal(format!("failed to spawn L3 business keepalive: {err}"))
+            })?;
         Ok(Self {
             state,
             incoming_rx: Mutex::new(rx),
@@ -1436,11 +1444,13 @@ impl L3Tunnel {
     pub fn virtual_ips(&self) -> Vec<Ipv4Addr> {
         self.state.vip_list.lock().unwrap().clone()
     }
-
 }
 
 impl L3TunnelState {
     fn remote_for(&self, node_group_id: &str) -> AtrResult<Arc<L3Remote>> {
+        // Keepalive startup may race the first real packet. Serialize the
+        // complete lookup-and-create operation to avoid duplicate remotes.
+        let _creation = self.remote_creation.lock().unwrap();
         if self.close_flag.load(Ordering::SeqCst) {
             return Err(AtrError::InvalidState("l3 tunnel closed".into()));
         }
@@ -1597,7 +1607,10 @@ fn select_icmp_keepalive_target(client: &AtrClient) -> Option<Ipv4Addr> {
         if !protocol_allows_icmp(&domain_resource.protocol) {
             continue;
         }
-        if matches!(client.route_icmp(&ip.to_string()), RouteDecision::Managed(_)) {
+        if matches!(
+            client.route_icmp(&ip.to_string()),
+            RouteDecision::Managed(_)
+        ) {
             return Some(*ip);
         }
     }
@@ -1607,7 +1620,10 @@ fn select_icmp_keepalive_target(client: &AtrClient) -> Option<Ipv4Addr> {
             continue;
         }
         let candidate = representative_ipv4(ip_resource.ip_min, ip_resource.ip_max)?;
-        if matches!(client.route_icmp(&candidate.to_string()), RouteDecision::Managed(_)) {
+        if matches!(
+            client.route_icmp(&candidate.to_string()),
+            RouteDecision::Managed(_)
+        ) {
             return Some(candidate);
         }
     }
@@ -1712,6 +1728,23 @@ impl ConntrackMgr {
     fn by_id(&self, auth_id: u64) -> Option<Arc<Conntrack>> {
         self.by_id.lock().unwrap().get(&auth_id).cloned()
     }
+
+    fn fail_pending(&self, error: AtrError) {
+        let conntracks = self
+            .by_id
+            .lock()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for conntrack in conntracks {
+            let mut result = conntrack.auth_result.lock().unwrap();
+            if result.is_none() {
+                *result = Some(Err(error.clone()));
+                conntrack.auth_cv.notify_all();
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1723,15 +1756,51 @@ struct L3ClientInfo {
 
 #[derive(Debug)]
 struct L3Remote {
-    stream: Arc<Mutex<StreamOwned<ClientConnection, TcpStream>>>,
+    command_tx: mpsc::Sender<L3RemoteCommand>,
+    wake_tx: Mutex<TcpStream>,
     info: L3ClientInfo,
     sign_key: Vec<u8>,
     conntracks: Arc<ConntrackMgr>,
     close_flag: Arc<AtomicBool>,
-    write_interest: Arc<AtomicUsize>,
-    vip_list: Arc<Mutex<Vec<Ipv4Addr>>>,
-    close_notify: Arc<(Mutex<bool>, Condvar)>,
-    workers: Mutex<Vec<thread::JoinHandle<()>>>,
+    worker: Mutex<Option<thread::JoinHandle<()>>>,
+}
+
+struct L3BufferedStream {
+    reader: BufReader<StreamOwned<ClientConnection, TcpStream>>,
+}
+
+impl L3BufferedStream {
+    fn new(stream: StreamOwned<ClientConnection, TcpStream>) -> Self {
+        Self {
+            reader: BufReader::with_capacity(64 * 1024, stream),
+        }
+    }
+
+    fn socket(&self) -> &TcpStream {
+        &self.reader.get_ref().sock
+    }
+}
+
+impl Read for L3BufferedStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.reader.read(buf)
+    }
+}
+
+impl Write for L3BufferedStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.reader.get_mut().write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.reader.get_mut().flush()
+    }
+}
+
+#[derive(Debug)]
+enum L3RemoteCommand {
+    Write(Vec<u8>),
+    Close,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1752,164 +1821,51 @@ impl L3Remote {
         incoming_tx: mpsc::Sender<Vec<u8>>,
         vip_list: Arc<Mutex<Vec<Ipv4Addr>>>,
     ) -> AtrResult<Self> {
-        let stream = connect_tls(&addr, client.client_config())?;
+        let mut stream = connect_tls(&addr, client.client_config())?;
         stream.sock.set_read_timeout(Some(Duration::from_millis(
             client.client_config().io_timeout_ms,
         )))?;
-        let remote = Self {
-            stream: Arc::new(Mutex::new(stream)),
-            info: L3ClientInfo {
-                sid: session.sid,
-                device_id: session.device_id,
-                connection_id: session.connection_id,
-            },
-            sign_key: hex::decode(session.sign_key_hex)
-                .map_err(|e| AtrError::CryptoFailed(e.to_string()))?,
-            conntracks: Arc::new(ConntrackMgr::new()),
-            close_flag: Arc::new(AtomicBool::new(false)),
-            write_interest: Arc::new(AtomicUsize::new(0)),
-            vip_list,
-            close_notify: Arc::new((Mutex::new(false), Condvar::new())),
-            workers: Mutex::new(Vec::new()),
+        let info = L3ClientInfo {
+            sid: session.sid,
+            device_id: session.device_id,
+            connection_id: session.connection_id,
         };
-        remote.auth_tunnel()?;
-        {
-            let stream = remote.stream.lock().unwrap();
-            stream
-                .sock
-                .set_read_timeout(Some(Duration::from_millis(5)))?;
-        }
-        remote.spawn_loops(incoming_tx);
-        Ok(remote)
-    }
+        let sign_key = hex::decode(session.sign_key_hex)
+            .map_err(|e| AtrError::CryptoFailed(e.to_string()))?;
+        authenticate_l3_stream(&mut stream, &info, &vip_list)?;
+        stream.sock.set_read_timeout(None)?;
 
-    fn spawn_loops(&self, incoming_tx: mpsc::Sender<Vec<u8>>) {
-        let reader = self.stream.clone();
-        let conntracks = self.conntracks.clone();
-        let close = self.close_flag.clone();
-        let write_interest = self.write_interest.clone();
-        let heartbeat_stream = self.stream.clone();
-        let heartbeat_close = self.close_flag.clone();
-        let heartbeat_write_interest = self.write_interest.clone();
-        let vip_list = self.vip_list.clone();
-        let close_notify = self.close_notify.clone();
-        let reader_notify = self.close_notify.clone();
-
-        let reader_stream = reader.clone();
-        let reader_close = close.clone();
-        let reader_worker = thread::Builder::new()
-            .name("libreatrust-l3-reader".into())
+        let conntracks = Arc::new(ConntrackMgr::new());
+        let close_flag = Arc::new(AtomicBool::new(false));
+        let (command_tx, command_rx) = mpsc::channel();
+        let (wake_rx, wake_tx) = tcp_stream_pair()?;
+        let worker_conntracks = conntracks.clone();
+        let worker_close = close_flag.clone();
+        let worker_vip_list = vip_list.clone();
+        let worker = thread::Builder::new()
+            .name("libreatrust-l3-io".into())
             .spawn(move || {
-                crate::diag_log("[libreatrust][l3] reader worker started".to_string());
-                loop {
-                    if close.load(Ordering::SeqCst) {
-                        crate::diag_log(
-                            "[libreatrust][l3] reader worker noticed close flag".to_string(),
-                        );
-                        break;
-                    }
-                    if write_interest.load(Ordering::SeqCst) > 0 {
-                        thread::sleep(Duration::from_millis(1));
-                        continue;
-                    }
-                    let frame = {
-                        let mut stream = reader.lock().unwrap();
-                        read_l3_frame_available(&mut *stream)
-                    };
-                    let frame = match frame {
-                        Ok(Some(v)) => v,
-                        Ok(None) => continue,
-                        Err(error) => {
-                            crate::diag_log(format!(
-                                "[libreatrust][l3] reader worker frame read failed error={error}"
-                            ));
-                            break;
-                        }
-                    };
-                    match frame.cmd {
-                        0x94 => {
-                            if frame.data_mode == DataMode::Len {
-                                let _ = incoming_tx.send(frame.payload);
-                            } else if let Ok(packets) = parse_data_payload(&frame.payload) {
-                                for pkt in packets {
-                                    let _ = incoming_tx.send(pkt);
-                                }
-                            }
-                        }
-                        0x93 => {
-                            let _ = handle_auth_resp(&conntracks, frame.status, &frame.payload);
-                        }
-                        0x95 => {}
-                        0x96 => {
-                            if let Some(ips) = parse_virtual_ip_bytes(&frame.payload) {
-                                *vip_list.lock().unwrap() = ips;
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                crate::diag_log(format!(
-                    "[libreatrust][l3] reader worker exiting close_flag={}",
-                    reader_close.load(Ordering::SeqCst)
-                ));
-                reader_close.store(true, Ordering::SeqCst);
-                let (closed, notify) = &*reader_notify;
-                *closed.lock().unwrap() = true;
-                notify.notify_all();
-                if let Ok(stream) = reader_stream.lock() {
-                    let result = stream.sock.shutdown(Shutdown::Both);
-                    crate::diag_log(format!(
-                        "[libreatrust][l3] reader worker socket shutdown result={result:?}"
-                    ));
-                }
+                run_l3_remote_worker(
+                    stream,
+                    incoming_tx,
+                    command_rx,
+                    wake_rx,
+                    worker_conntracks,
+                    worker_close,
+                    worker_vip_list,
+                )
             })
-            .expect("failed to spawn L3 reader");
+            .map_err(|err| AtrError::Internal(format!("failed to start L3 I/O worker: {err}")))?;
 
-        let heartbeat_worker = thread::Builder::new()
-            .name("libreatrust-l3-heartbeat".into())
-            .spawn(move || {
-                crate::diag_log(
-                    "[libreatrust][l3] heartbeat worker started interval_secs=25".to_string(),
-                );
-                while !heartbeat_close.load(Ordering::SeqCst) {
-                    let (closed, notify) = &*close_notify;
-                    let guard = closed.lock().unwrap();
-                    if *guard {
-                        break;
-                    }
-                    let (guard, _) = notify.wait_timeout(guard, Duration::from_secs(25)).unwrap();
-                    if *guard || heartbeat_close.load(Ordering::SeqCst) {
-                        crate::diag_log(format!(
-                            "[libreatrust][l3] heartbeat worker stopping closed={} close_flag={}",
-                            *guard,
-                            heartbeat_close.load(Ordering::SeqCst)
-                        ));
-                        break;
-                    }
-                    heartbeat_write_interest.fetch_add(1, Ordering::SeqCst);
-                    let mut stream = heartbeat_stream.lock().unwrap();
-                    let write_result = stream
-                        .write_all(&[0x05, 0x15, 0x00, 0x00])
-                        .and_then(|_| stream.flush());
-                    heartbeat_write_interest.fetch_sub(1, Ordering::SeqCst);
-
-                    match write_result {
-                        Ok(()) => crate::diag_log(
-                            "[libreatrust][l3] heartbeat worker sent heartbeat".to_string(),
-                        ),
-                        Err(error) => crate::diag_log(format!(
-                            "[libreatrust][l3] heartbeat worker send failed error={error}"
-                        )),
-                    }
-                }
-                crate::diag_log("[libreatrust][l3] heartbeat worker stopped".to_string());
-            })
-            .expect("failed to spawn L3 heartbeat");
-
-        self.workers
-            .lock()
-            .unwrap()
-            .extend([reader_worker, heartbeat_worker]);
+        Ok(Self {
+            command_tx,
+            wake_tx: Mutex::new(wake_tx),
+            info,
+            sign_key,
+            conntracks,
+            close_flag,
+            worker: Mutex::new(Some(worker)),
+        })
     }
 
     fn close(&self) {
@@ -1917,111 +1873,16 @@ impl L3Remote {
         crate::diag_log(format!(
             "[libreatrust][l3] remote close requested already_closed={was_closed}"
         ));
-        let (closed, notify) = &*self.close_notify;
-        *closed.lock().unwrap() = true;
-        notify.notify_all();
-        if let Ok(stream) = self.stream.lock() {
-            let result = stream.sock.shutdown(Shutdown::Both);
-            crate::diag_log(format!(
-                "[libreatrust][l3] remote socket shutdown result={result:?}"
-            ));
+        if !was_closed {
+            let _ = self.command_tx.send(L3RemoteCommand::Close);
+            self.wake_worker();
         }
-        let workers = std::mem::take(&mut *self.workers.lock().unwrap());
-        crate::diag_log(format!(
-            "[libreatrust][l3] remote joining workers count={}",
-            workers.len()
-        ));
-        for worker in workers {
+        if let Some(worker) = self.worker.lock().unwrap().take() {
             if worker.join().is_err() {
                 crate::diag_log("[libreatrust][l3] remote worker join failed".to_string());
             }
         }
         crate::diag_log("[libreatrust][l3] remote close completed".to_string());
-    }
-
-    fn auth_tunnel(&self) -> AtrResult<()> {
-        let req = serde_json::to_vec(&json!({ "sid": self.info.sid }))?;
-        let packet = wrap_auth_req_data(&req, 1);
-        {
-            let mut stream = self.stream.lock().unwrap();
-            crate::diag_log("[libreatrust][l3] tunnel auth send sid".to_string());
-            stream.write_all(&packet)?;
-            stream.flush()?;
-        }
-
-        let mut stream = self.stream.lock().unwrap();
-        let mut method = [0u8; 2];
-        stream.read_exact(&mut method)?;
-        crate::diag_log(format!(
-            "[libreatrust][l3] tunnel auth method={method:02x?}"
-        ));
-        if method != [0x05, 0xD0] {
-            return Err(AtrError::NetworkFailed(format!(
-                "unexpected auth method {:?}",
-                method
-            )));
-        }
-
-        let mut header = [0u8; 4];
-        stream.read_exact(&mut header)?;
-        crate::diag_log(format!(
-            "[libreatrust][l3] tunnel auth header={header:02x?}"
-        ));
-        if header[0] != 0x53 {
-            return Err(AtrError::NetworkFailed(format!(
-                "unexpected auth header {:02x?}",
-                header
-            )));
-        }
-        let status = header[1];
-        let len = u16::from_be_bytes([header[2], header[3]]) as usize;
-        let mut payload = vec![0u8; len];
-        if len > 0 {
-            stream.read_exact(&mut payload)?;
-        }
-        if !payload.is_empty() {
-            crate::diag_log(format!(
-                "[libreatrust][l3] tunnel auth payload {}",
-                String::from_utf8_lossy(&payload)
-            ));
-        }
-        if status != 0 {
-            return Err(AtrError::Unauthorized(
-                String::from_utf8_lossy(&payload).into_owned(),
-            ));
-        }
-        if !payload.is_empty() {
-            let resp: AuthResponseSid = serde_json::from_slice(&payload)?;
-            if resp.code != 0 {
-                return Err(AtrError::Unauthorized(format!(
-                    "tunnel auth failed: {}",
-                    resp.message
-                )));
-            }
-        }
-        let mut vip_header = [0u8; 4];
-        if read_tunnel_exact(&mut *stream, &mut vip_header)? && vip_header[0] == 0x05 {
-            crate::diag_log(format!(
-                "[libreatrust][l3] tunnel auth optional vip header={vip_header:02x?}"
-            ));
-            let data_len = vip_payload_length(vip_header[3]);
-            if data_len > 0 {
-                let mut vip_data = vec![0u8; data_len];
-                read_tunnel_exact_blocking(&mut *stream, &mut vip_data)?;
-                if let Some(ips) = parse_virtual_ip_bytes(&vip_data) {
-                    crate::diag_log(format!(
-                        "[libreatrust][l3] tunnel auth vip={}",
-                        ips.iter()
-                            .map(ToString::to_string)
-                            .collect::<Vec<_>>()
-                            .join(",")
-                    ));
-                    *self.vip_list.lock().unwrap() = ips;
-                }
-            }
-        }
-        crate::diag_log("[libreatrust][l3] tunnel auth ready".to_string());
-        Ok(())
     }
 
     fn write_packet(
@@ -2042,26 +1903,11 @@ impl L3Remote {
             .clone()
             .ok_or_else(|| AtrError::InvalidState("missing connect token".into()))?;
         let payload = build_data_payload(&token, &[pkt.to_vec()]);
-        self.write_interest.fetch_add(1, Ordering::SeqCst);
-        let write_result = {
-            let mut stream = self.stream.lock().unwrap();
-            stream.write_all(&payload).and_then(|_| stream.flush())
-        };
-        self.write_interest.fetch_sub(1, Ordering::SeqCst);
-        write_result?;
-        Ok(())
+        self.enqueue_payload(payload)
     }
 
     fn send_heartbeat(&self) -> AtrResult<()> {
-        self.write_interest.fetch_add(1, Ordering::SeqCst);
-        let write_result = {
-            let mut stream = self.stream.lock().unwrap();
-            stream
-                .write_all(&[0x05, 0x15, 0x00, 0x00])
-                .and_then(|_| stream.flush())
-        };
-        self.write_interest.fetch_sub(1, Ordering::SeqCst);
-        write_result?;
+        self.enqueue_payload(vec![0x05, 0x15, 0x00, 0x00])?;
         crate::diag_log("[libreatrust][l3] keep-alive heartbeat sent".to_string());
         Ok(())
     }
@@ -2101,16 +1947,304 @@ impl L3Remote {
     fn send_auth_request(&self, ct: &Arc<Conntrack>, meta: PacketMeta) -> AtrResult<()> {
         let req = build_auth_request(&self.info, &self.sign_key, meta, ct)?;
         let packet = build_l3_auth_request_payload(&req)?;
-        self.write_interest.fetch_add(1, Ordering::SeqCst);
         crate::diag_log(format!("[libreatrust][l3] auth request key={}", ct.key));
-        let write_result = {
-            let mut stream = self.stream.lock().unwrap();
-            stream.write_all(&packet).and_then(|_| stream.flush())
-        };
-        self.write_interest.fetch_sub(1, Ordering::SeqCst);
-        write_result?;
+        self.enqueue_payload(packet)
+    }
+
+    fn enqueue_payload(&self, payload: Vec<u8>) -> AtrResult<()> {
+        if self.close_flag.load(Ordering::SeqCst) {
+            return Err(AtrError::NetworkFailed("l3 remote closed".into()));
+        }
+        self.command_tx
+            .send(L3RemoteCommand::Write(payload))
+            .map_err(|_| AtrError::NetworkFailed("l3 I/O worker stopped".into()))?;
+        self.wake_worker();
         Ok(())
     }
+
+    fn wake_worker(&self) {
+        if let Ok(mut wake_tx) = self.wake_tx.lock() {
+            let _ = wake_tx.write_all(&[1]);
+        }
+    }
+}
+
+fn authenticate_l3_stream(
+    stream: &mut StreamOwned<ClientConnection, TcpStream>,
+    info: &L3ClientInfo,
+    vip_list: &Arc<Mutex<Vec<Ipv4Addr>>>,
+) -> AtrResult<()> {
+    let req = serde_json::to_vec(&json!({ "sid": info.sid }))?;
+    let packet = wrap_auth_req_data(&req, 1);
+    crate::diag_log("[libreatrust][l3] tunnel auth send sid".to_string());
+    stream.write_all(&packet)?;
+    stream.flush()?;
+
+    let mut method = [0u8; 2];
+    stream.read_exact(&mut method)?;
+    crate::diag_log(format!(
+        "[libreatrust][l3] tunnel auth method={method:02x?}"
+    ));
+    if method != [0x05, 0xD0] {
+        return Err(AtrError::NetworkFailed(format!(
+            "unexpected auth method {:?}",
+            method
+        )));
+    }
+
+    let mut header = [0u8; 4];
+    stream.read_exact(&mut header)?;
+    crate::diag_log(format!(
+        "[libreatrust][l3] tunnel auth header={header:02x?}"
+    ));
+    if header[0] != 0x53 {
+        return Err(AtrError::NetworkFailed(format!(
+            "unexpected auth header {:02x?}",
+            header
+        )));
+    }
+    let status = header[1];
+    let len = u16::from_be_bytes([header[2], header[3]]) as usize;
+    let mut payload = vec![0u8; len];
+    if len > 0 {
+        stream.read_exact(&mut payload)?;
+    }
+    if !payload.is_empty() {
+        crate::diag_log(format!(
+            "[libreatrust][l3] tunnel auth payload {}",
+            String::from_utf8_lossy(&payload)
+        ));
+    }
+    if status != 0 {
+        return Err(AtrError::Unauthorized(
+            String::from_utf8_lossy(&payload).into_owned(),
+        ));
+    }
+    if !payload.is_empty() {
+        let resp: AuthResponseSid = serde_json::from_slice(&payload)?;
+        if resp.code != 0 {
+            return Err(AtrError::Unauthorized(format!(
+                "tunnel auth failed: {}",
+                resp.message
+            )));
+        }
+    }
+
+    let mut vip_header = [0u8; 4];
+    if read_tunnel_exact(&mut *stream, &mut vip_header)? && vip_header[0] == 0x05 {
+        crate::diag_log(format!(
+            "[libreatrust][l3] tunnel auth optional vip header={vip_header:02x?}"
+        ));
+        let data_len = vip_payload_length(vip_header[3]);
+        if data_len > 0 {
+            let mut vip_data = vec![0u8; data_len];
+            read_tunnel_exact_blocking(&mut *stream, &mut vip_data)?;
+            if let Some(ips) = parse_virtual_ip_bytes(&vip_data) {
+                crate::diag_log(format!(
+                    "[libreatrust][l3] tunnel auth vip={}",
+                    ips.iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ));
+                *vip_list.lock().unwrap() = ips;
+            }
+        }
+    }
+    crate::diag_log("[libreatrust][l3] tunnel auth ready".to_string());
+    Ok(())
+}
+
+fn run_l3_remote_worker(
+    stream: StreamOwned<ClientConnection, TcpStream>,
+    incoming_tx: mpsc::Sender<Vec<u8>>,
+    command_rx: mpsc::Receiver<L3RemoteCommand>,
+    mut wake_rx: TcpStream,
+    conntracks: Arc<ConntrackMgr>,
+    close_flag: Arc<AtomicBool>,
+    vip_list: Arc<Mutex<Vec<Ipv4Addr>>>,
+) {
+    crate::diag_log(format!(
+        "[libreatrust][l3] I/O worker started heartbeat_secs={} read_batch_frames={}",
+        L3_PROTOCOL_HEARTBEAT_INTERVAL.as_secs(),
+        L3_READ_BATCH_FRAMES
+    ));
+    let mut stream = L3BufferedStream::new(stream);
+    let result = run_l3_remote_worker_inner(
+        &mut stream,
+        &incoming_tx,
+        &command_rx,
+        &mut wake_rx,
+        &conntracks,
+        &vip_list,
+    );
+    close_flag.store(true, Ordering::SeqCst);
+    let failure = match result {
+        Ok(()) => AtrError::NetworkFailed("l3 remote closed".into()),
+        Err(error) => {
+            crate::diag_log(format!(
+                "[libreatrust][l3] I/O worker stopped with error={error}"
+            ));
+            error
+        }
+    };
+    conntracks.fail_pending(failure);
+    let _ = stream.socket().shutdown(Shutdown::Both);
+    crate::diag_log("[libreatrust][l3] I/O worker stopped".to_string());
+}
+
+fn run_l3_remote_worker_inner(
+    stream: &mut L3BufferedStream,
+    incoming_tx: &mpsc::Sender<Vec<u8>>,
+    command_rx: &mpsc::Receiver<L3RemoteCommand>,
+    wake_rx: &mut TcpStream,
+    conntracks: &Arc<ConntrackMgr>,
+    vip_list: &Arc<Mutex<Vec<Ipv4Addr>>>,
+) -> AtrResult<()> {
+    use mio::event::Event;
+    use mio::net::TcpStream as MioTcpStream;
+    use mio::{Events, Interest, Poll, Token};
+
+    let mut socket_poll = MioTcpStream::from_std(stream.socket().try_clone()?);
+    let mut wake_poll = MioTcpStream::from_std(wake_rx.try_clone()?);
+    let mut poll = Poll::new().map_err(AtrError::from)?;
+    poll.registry()
+        .register(&mut socket_poll, Token(0), Interest::READABLE)?;
+    poll.registry()
+        .register(&mut wake_poll, Token(1), Interest::READABLE)?;
+    let mut events = Events::with_capacity(8);
+    let mut next_heartbeat = Instant::now() + L3_PROTOCOL_HEARTBEAT_INTERVAL;
+    let mut continue_reading = false;
+
+    loop {
+        if !drain_l3_remote_commands(stream, command_rx)? {
+            return Ok(());
+        }
+
+        if Instant::now() >= next_heartbeat {
+            stream.write_all(&[0x05, 0x15, 0x00, 0x00])?;
+            stream.flush()?;
+            crate::diag_log("[libreatrust][l3] I/O worker sent heartbeat".to_string());
+            next_heartbeat = Instant::now() + L3_PROTOCOL_HEARTBEAT_INTERVAL;
+        }
+
+        if continue_reading {
+            continue_reading = drain_l3_remote_frames(
+                stream,
+                incoming_tx,
+                conntracks,
+                vip_list,
+                L3_READ_BATCH_FRAMES,
+            )?;
+            continue;
+        }
+
+        let timeout = next_heartbeat.saturating_duration_since(Instant::now());
+        events.clear();
+        poll.poll(&mut events, Some(timeout))
+            .map_err(AtrError::from)?;
+
+        let wake_readable = events
+            .iter()
+            .any(|event: &Event| event.token() == Token(1));
+        let socket_readable = events
+            .iter()
+            .any(|event: &Event| event.token() == Token(0));
+
+        if wake_readable {
+            drain_wake_stream(wake_rx);
+            if !drain_l3_remote_commands(stream, command_rx)? {
+                return Ok(());
+            }
+        }
+        if socket_readable {
+            continue_reading = drain_l3_remote_frames(
+                stream,
+                incoming_tx,
+                conntracks,
+                vip_list,
+                L3_READ_BATCH_FRAMES,
+            )?;
+        }
+
+    }
+}
+
+fn drain_l3_remote_commands<W: Write>(
+    stream: &mut W,
+    command_rx: &mpsc::Receiver<L3RemoteCommand>,
+) -> AtrResult<bool> {
+    while let Ok(command) = command_rx.try_recv() {
+        match command {
+            L3RemoteCommand::Write(payload) => {
+                stream.write_all(&payload).map_err(AtrError::from)?;
+            }
+            L3RemoteCommand::Close => return Ok(false),
+        }
+    }
+    stream.flush().map_err(AtrError::from)?;
+    Ok(true)
+}
+
+fn drain_l3_remote_frames(
+    stream: &mut L3BufferedStream,
+    incoming_tx: &mpsc::Sender<Vec<u8>>,
+    conntracks: &Arc<ConntrackMgr>,
+    vip_list: &Arc<Mutex<Vec<Ipv4Addr>>>,
+    frame_limit: usize,
+) -> AtrResult<bool> {
+    stream.socket().set_read_timeout(Some(Duration::from_millis(1)))?;
+    let result = (|| {
+        for _ in 0..frame_limit {
+            let Some(frame) = read_l3_frame_available(stream)? else {
+                return Ok(false);
+            };
+            handle_l3_remote_frame(frame, incoming_tx, conntracks, vip_list)?;
+        }
+        Ok(true)
+    })();
+    let reset_result = stream.socket().set_read_timeout(None).map_err(AtrError::from);
+    match (result, reset_result) {
+        (Err(error), _) | (_, Err(error)) => Err(error),
+        (Ok(more), Ok(())) => Ok(more),
+    }
+}
+
+fn handle_l3_remote_frame(
+    frame: Frame,
+    incoming_tx: &mpsc::Sender<Vec<u8>>,
+    conntracks: &Arc<ConntrackMgr>,
+    vip_list: &Arc<Mutex<Vec<Ipv4Addr>>>,
+) -> AtrResult<()> {
+    match frame.cmd {
+        0x94 => match decode_l3_data_payload(&frame.payload, frame.data_mode) {
+            Ok(packets) => {
+                for packet in packets {
+                    incoming_tx.send(packet).map_err(|_| {
+                        AtrError::NetworkFailed("l3 packet receiver stopped".into())
+                    })?;
+                }
+            }
+            Err(error) => crate::diag_log(format!(
+                "[libreatrust][l3] data payload decode failed error={error}"
+            )),
+        },
+        0x93 => {
+            if let Err(error) = handle_auth_resp(conntracks, frame.status, &frame.payload) {
+                crate::diag_log(format!(
+                    "[libreatrust][l3] auth response handling failed error={error}"
+                ));
+            }
+        }
+        0x95 => {}
+        0x96 => {
+            if let Some(ips) = parse_virtual_ip_bytes(&frame.payload) {
+                *vip_list.lock().unwrap() = ips;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -2200,9 +2334,7 @@ impl ServerCertVerifier for NoVerifier {
     }
 }
 
-fn read_l3_frame_available(
-    stream: &mut StreamOwned<ClientConnection, TcpStream>,
-) -> AtrResult<Option<Frame>> {
+fn read_l3_frame_available<R: Read>(stream: &mut R) -> AtrResult<Option<Frame>> {
     loop {
         let mut header = [0u8; 2];
         if !read_tunnel_exact(stream, &mut header)? {
@@ -2269,9 +2401,7 @@ fn read_l3_frame_available(
     }
 }
 
-fn read_data_resp_payload(
-    stream: &mut StreamOwned<ClientConnection, TcpStream>,
-) -> AtrResult<(Vec<u8>, DataMode)> {
+fn read_data_resp_payload<R: Read>(stream: &mut R) -> AtrResult<(Vec<u8>, DataMode)> {
     let mut peek = [0u8; 2];
     read_tunnel_exact_blocking(stream, &mut peek)?;
     let payload_len = u16::from_be_bytes(peek) as usize;
@@ -2533,6 +2663,32 @@ fn parse_data_payload(payload: &[u8]) -> AtrResult<Vec<Vec<u8>>> {
     Ok(packets)
 }
 
+fn decode_l3_data_payload(payload: &[u8], mode: DataMode) -> AtrResult<Vec<Vec<u8>>> {
+    // Some aTrust servers put a token envelope behind a u16 length prefix,
+    // while others put a raw IP packet there. The framing mode alone does not
+    // identify the payload. Only bypass the token decoder when the bytes form
+    // a structurally valid IP packet.
+    if mode == DataMode::Len && is_complete_ip_packet(payload) {
+        return Ok(vec![payload.to_vec()]);
+    }
+    parse_data_payload(payload)
+}
+
+fn is_complete_ip_packet(packet: &[u8]) -> bool {
+    match packet.first().map(|byte| byte >> 4) {
+        Some(4) if packet.len() >= 20 => {
+            let header_len = usize::from(packet[0] & 0x0f) * 4;
+            let total_len = usize::from(u16::from_be_bytes([packet[2], packet[3]]));
+            header_len >= 20 && total_len >= header_len && total_len <= packet.len()
+        }
+        Some(6) if packet.len() >= 40 => {
+            let payload_len = usize::from(u16::from_be_bytes([packet[4], packet[5]]));
+            40 + payload_len <= packet.len()
+        }
+        _ => false,
+    }
+}
+
 fn handle_auth_resp(conntracks: &Arc<ConntrackMgr>, status: u8, payload: &[u8]) -> AtrResult<()> {
     if status != 0 {
         return Ok(());
@@ -2778,7 +2934,11 @@ fn udp_checksum(src_ip: Ipv4Addr, dst_ip: Ipv4Addr, udp: &[u8]) -> u16 {
         pseudo.push(0);
     }
     let sum = checksum_words(&pseudo);
-    if sum == 0 { 0xFFFF } else { sum }
+    if sum == 0 {
+        0xFFFF
+    } else {
+        sum
+    }
 }
 
 fn checksum_words(data: &[u8]) -> u16 {
@@ -2970,15 +3130,16 @@ impl fmt::Display for PacketMeta {
 #[cfg(test)]
 mod tests {
     use super::{
-        TcpFrameRead, TcpTunnel, TcpTunnelCommand, configure_connected_tcp, read_tcp_frame,
-        tcp_stream_pair, wait_for_tcp_connect_status, write_tcp_payload,
+        configure_connected_tcp, decode_l3_data_payload, drain_l3_remote_commands,
+        read_tcp_frame, tcp_stream_pair, wait_for_tcp_connect_status, write_tcp_payload, DataMode,
+        L3RemoteCommand, TcpFrameRead, TcpTunnel, TcpTunnelCommand,
     };
     use socket2::SockRef;
     use std::collections::VecDeque;
     use std::io::{self, Cursor, Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::sync::atomic::AtomicBool;
-    use std::sync::{Mutex, mpsc};
+    use std::sync::{mpsc, Mutex};
 
     struct TestIo {
         input: Cursor<Vec<u8>>,
@@ -3094,6 +3255,22 @@ mod tests {
     }
 
     #[test]
+    fn l3_io_worker_batches_queued_writes_in_order() {
+        let (command_tx, command_rx) = mpsc::channel();
+        command_tx
+            .send(L3RemoteCommand::Write(vec![1, 2, 3]))
+            .unwrap();
+        command_tx
+            .send(L3RemoteCommand::Write(vec![4, 5]))
+            .unwrap();
+        command_tx.send(L3RemoteCommand::Close).unwrap();
+
+        let mut output = Vec::new();
+        assert!(!drain_l3_remote_commands(&mut output, &command_rx).unwrap());
+        assert_eq!(output, [1, 2, 3, 4, 5]);
+    }
+
+    #[test]
     fn distinguishes_consumed_control_frames_from_pending_input() {
         let mut input = Cursor::new(vec![
             0x53, 0x00, 0x00, 0x02, b'O', b'K', 0x01, 0x00, 0x00, 0x03, 1, 2, 3,
@@ -3119,6 +3296,40 @@ mod tests {
             Some(TcpFrameRead::Data(data)) => assert_eq!(data, [1, 2, 3]),
             _ => panic!("expected application data after extension header"),
         }
+    }
+
+    fn ipv4_packet() -> Vec<u8> {
+        let mut packet = vec![0u8; 20];
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&20u16.to_be_bytes());
+        packet
+    }
+
+    #[test]
+    fn decodes_raw_ip_from_length_framed_l3_data() {
+        let packet = ipv4_packet();
+        assert_eq!(
+            decode_l3_data_payload(&packet, DataMode::Len).unwrap(),
+            vec![packet]
+        );
+    }
+
+    #[test]
+    fn decodes_token_envelope_from_length_framed_l3_data() {
+        let packet = ipv4_packet();
+        let token = vec![b'a'; 32];
+        let mut payload = Vec::new();
+        payload.push(token.len() as u8);
+        payload.extend_from_slice(&token);
+        payload.extend_from_slice(&[0, 0]);
+        payload.push(1);
+        payload.extend_from_slice(&(packet.len() as u16).to_be_bytes());
+        payload.extend_from_slice(&packet);
+
+        assert_eq!(
+            decode_l3_data_payload(&payload, DataMode::Len).unwrap(),
+            vec![packet]
+        );
     }
 
     #[test]
