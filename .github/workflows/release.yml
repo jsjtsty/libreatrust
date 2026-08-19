@@ -65,8 +65,16 @@ jobs:
         run: |
           $package = "dist/libreatrust-${{ matrix.name }}"
           New-Item -ItemType Directory -Force $package | Out-Null
-          Copy-Item target/release/libreatrust.lib $package
-          Copy-Item target/release/libreatrust.dll $package
+          $libraries = @(Get-ChildItem target/release -File | Where-Object {
+            $_.Extension -in @('.dll', '.lib', '.a')
+          })
+          if (-not ($libraries | Where-Object { $_.Extension -eq '.dll' })) {
+            throw "No Windows dynamic library found in target/release"
+          }
+          if (-not ($libraries | Where-Object { $_.Extension -in @('.lib', '.a') })) {
+            throw "No Windows static or import library found in target/release"
+          }
+          Copy-Item $libraries.FullName $package
           Copy-Item include/libreatrust.h $package
           Compress-Archive -Path $package -DestinationPath "libreatrust-${{ matrix.name }}.zip"
 
