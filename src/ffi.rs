@@ -435,7 +435,6 @@ fn copy_session_material(session: &SessionMaterial) -> Result<atr_session_materi
     for cookie in &session.cookies {
         cookies.push(copy_cookie_record(cookie)?);
     }
-    let mut cookies = cookies;
     let list = atr_cookie_list_t {
         len: cookies.len(),
         items: cookies.as_mut_ptr(),
@@ -1304,7 +1303,6 @@ pub extern "C" fn atr_auth_session_available_methods(
                     .into_raw(),
             });
         }
-        let mut out_items = out_items;
         unsafe {
             *out = atr_auth_method_list_t {
                 len: out_items.len(),
@@ -1914,10 +1912,10 @@ pub extern "C" fn atr_l3_tunnel_get_virtual_ips(
     if tunnel.is_null() || out.is_null() {
         return ErrorCode::InvalidArgument as i32;
     }
-    let result = (|| -> Result<(), AtrError> {
+    let result: Result<(), AtrError> = {
         let ips = unsafe { &*tunnel }.inner.virtual_ips();
         set_ipaddr_string_list(out, ips)
-    })();
+    };
     match result {
         Ok(()) => ErrorCode::Ok as i32,
         Err(err) => store_error(&err) as i32,

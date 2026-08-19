@@ -345,6 +345,9 @@ fn set_no_sigpipe(fd: i32) {
             std::mem::size_of_val(&value) as libc::socklen_t,
         );
     }
+
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    let _ = fd;
 }
 
 pub(crate) fn connect_tcp_bound(
@@ -881,8 +884,9 @@ fn sockaddr_storage(addr: &SocketAddr) -> (libc::sockaddr_storage, usize) {
         SocketAddr::V4(v4) => {
             let mut storage = unsafe { std::mem::zeroed::<libc::sockaddr_storage>() };
             let raw = libc::sockaddr_in {
+                #[cfg(any(target_os = "macos", target_os = "ios"))]
                 sin_len: std::mem::size_of::<libc::sockaddr_in>() as u8,
-                sin_family: libc::AF_INET as u8,
+                sin_family: libc::AF_INET as _,
                 sin_port: v4.port().to_be(),
                 sin_addr: libc::in_addr {
                     s_addr: u32::from_ne_bytes(v4.ip().octets()),
@@ -897,8 +901,9 @@ fn sockaddr_storage(addr: &SocketAddr) -> (libc::sockaddr_storage, usize) {
         SocketAddr::V6(v6) => {
             let mut storage = unsafe { std::mem::zeroed::<libc::sockaddr_storage>() };
             let raw = libc::sockaddr_in6 {
+                #[cfg(any(target_os = "macos", target_os = "ios"))]
                 sin6_len: std::mem::size_of::<libc::sockaddr_in6>() as u8,
-                sin6_family: libc::AF_INET6 as u8,
+                sin6_family: libc::AF_INET6 as _,
                 sin6_port: v6.port().to_be(),
                 sin6_flowinfo: v6.flowinfo(),
                 sin6_addr: libc::in6_addr {
