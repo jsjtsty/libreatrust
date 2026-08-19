@@ -534,7 +534,7 @@ fn set_windows_bound_interface(
     };
     let result = unsafe {
         libc::setsockopt(
-            socket.as_raw_socket(),
+            socket.as_raw_socket() as usize,
             level,
             option,
             &value as *const _ as *const libc::c_char,
@@ -620,7 +620,7 @@ fn interface_index_by_name(name: &str) -> AtrResult<Option<u32>> {
 fn windows_adapters() -> AtrResult<Vec<(String, u32, u32)>> {
     use windows_sys::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, ERROR_SUCCESS};
     use windows_sys::Win32::NetworkManagement::IpHelper::{
-        GetAdaptersAddresses, IF_TYPE_ETHERNET_CSMACD, IF_TYPE_IEEE80211, IP_ADAPTER_ADDRESSES_LH,
+        GetAdaptersAddresses, IP_ADAPTER_ADDRESSES_LH,
     };
     use windows_sys::Win32::NetworkManagement::Ndis::IfOperStatusUp;
     use windows_sys::Win32::Networking::WinSock::AF_UNSPEC;
@@ -657,11 +657,16 @@ fn windows_adapters() -> AtrResult<Vec<(String, u32, u32)>> {
         let if_index = unsafe { adapter.Anonymous1.Anonymous.IfIndex };
         if adapter.OperStatus == IfOperStatusUp && if_index != 0 {
             let name = unsafe {
-                let mut length = 0usize;
-                while !adapter.FriendlyName.0.add(length).read().eq(&0) {
-                    length += 1;
+                let friendly_name = adapter.FriendlyName;
+                if friendly_name.is_null() {
+                    String::new()
+                } else {
+                    let mut length = 0usize;
+                    while friendly_name.add(length).read() != 0 {
+                        length += 1;
+                    }
+                    String::from_utf16_lossy(std::slice::from_raw_parts(friendly_name, length))
                 }
-                String::from_utf16_lossy(std::slice::from_raw_parts(adapter.FriendlyName.0, length))
             };
             adapters.push((name, if_index, adapter.IfType));
         }
