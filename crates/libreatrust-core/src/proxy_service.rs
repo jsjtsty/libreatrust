@@ -1,6 +1,6 @@
 use crate::client::AtrClient;
 use crate::error::{AtrError, AtrResult};
-use crate::transport::{connect_tcp_bound, L3Tunnel, TcpTunnel};
+use crate::transport::{L3Tunnel, TcpTunnel, connect_tcp_bound};
 use crate::types::RouteDecision;
 use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};

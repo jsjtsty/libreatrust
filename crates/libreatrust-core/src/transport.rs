@@ -2,9 +2,9 @@ use crate::client::AtrClient;
 use crate::error::{AtrError, AtrResult};
 use crate::sign::calc_request_sig;
 use crate::types::{ProtocolKind, RouteDecision};
+use rustls::SignatureScheme;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::SignatureScheme;
 use rustls::{ClientConfig as TlsClientConfig, ClientConnection, RootCertStore, StreamOwned};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -20,7 +20,7 @@ use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
 #[cfg(target_family = "unix")]
 use std::os::fd::FromRawFd;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -715,11 +715,7 @@ fn route_default_physical_interface(addr: &SocketAddr) -> Option<u32> {
     }
     let c_name = std::ffi::CString::new(interface).ok()?;
     let index = unsafe { libc::if_nametoindex(c_name.as_ptr()) };
-    if index == 0 {
-        None
-    } else {
-        Some(index)
-    }
+    if index == 0 { None } else { Some(index) }
 }
 
 #[cfg(target_family = "unix")]
@@ -1236,18 +1232,20 @@ impl UdpTunnel {
             let l3_reader = l3.clone();
             let close_flag_reader = close_flag.clone();
             let tx_reader = tx.clone();
-            thread::spawn(move || loop {
-                if close_flag_reader.load(Ordering::SeqCst) {
-                    break;
-                }
-                let packet = match l3_reader.read_packet() {
-                    Ok(pkt) => pkt,
-                    Err(_) => break,
-                };
-                if let Some(payload) =
-                    udp_payload_if_match(&packet, local_ip, local_port, remote_ip, port)
-                {
-                    let _ = tx_reader.send(payload);
+            thread::spawn(move || {
+                loop {
+                    if close_flag_reader.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let packet = match l3_reader.read_packet() {
+                        Ok(pkt) => pkt,
+                        Err(_) => break,
+                    };
+                    if let Some(payload) =
+                        udp_payload_if_match(&packet, local_ip, local_port, remote_ip, port)
+                    {
+                        let _ = tx_reader.send(payload);
+                    }
                 }
             });
         }
@@ -1830,8 +1828,8 @@ impl L3Remote {
             device_id: session.device_id,
             connection_id: session.connection_id,
         };
-        let sign_key = hex::decode(session.sign_key_hex)
-            .map_err(|e| AtrError::CryptoFailed(e.to_string()))?;
+        let sign_key =
+            hex::decode(session.sign_key_hex).map_err(|e| AtrError::CryptoFailed(e.to_string()))?;
         authenticate_l3_stream(&mut stream, &info, &vip_list)?;
         stream.sock.set_read_timeout(None)?;
 
@@ -2144,12 +2142,8 @@ fn run_l3_remote_worker_inner(
         poll.poll(&mut events, Some(timeout))
             .map_err(AtrError::from)?;
 
-        let wake_readable = events
-            .iter()
-            .any(|event: &Event| event.token() == Token(1));
-        let socket_readable = events
-            .iter()
-            .any(|event: &Event| event.token() == Token(0));
+        let wake_readable = events.iter().any(|event: &Event| event.token() == Token(1));
+        let socket_readable = events.iter().any(|event: &Event| event.token() == Token(0));
 
         if wake_readable {
             drain_wake_stream(wake_rx);
@@ -2166,7 +2160,6 @@ fn run_l3_remote_worker_inner(
                 L3_READ_BATCH_FRAMES,
             )?;
         }
-
     }
 }
 
@@ -2193,7 +2186,9 @@ fn drain_l3_remote_frames(
     vip_list: &Arc<Mutex<Vec<Ipv4Addr>>>,
     frame_limit: usize,
 ) -> AtrResult<bool> {
-    stream.socket().set_read_timeout(Some(Duration::from_millis(1)))?;
+    stream
+        .socket()
+        .set_read_timeout(Some(Duration::from_millis(1)))?;
     let result = (|| {
         for _ in 0..frame_limit {
             let Some(frame) = read_l3_frame_available(stream)? else {
@@ -2203,7 +2198,10 @@ fn drain_l3_remote_frames(
         }
         Ok(true)
     })();
-    let reset_result = stream.socket().set_read_timeout(None).map_err(AtrError::from);
+    let reset_result = stream
+        .socket()
+        .set_read_timeout(None)
+        .map_err(AtrError::from);
     match (result, reset_result) {
         (Err(error), _) | (_, Err(error)) => Err(error),
         (Ok(more), Ok(())) => Ok(more),
@@ -2943,11 +2941,7 @@ fn udp_checksum(src_ip: Ipv4Addr, dst_ip: Ipv4Addr, udp: &[u8]) -> u16 {
         pseudo.push(0);
     }
     let sum = checksum_words(&pseudo);
-    if sum == 0 {
-        0xFFFF
-    } else {
-        sum
-    }
+    if sum == 0 { 0xFFFF } else { sum }
 }
 
 fn checksum_words(data: &[u8]) -> u16 {
@@ -3139,16 +3133,16 @@ impl fmt::Display for PacketMeta {
 #[cfg(test)]
 mod tests {
     use super::{
-        configure_connected_tcp, decode_l3_data_payload, drain_l3_remote_commands,
-        read_tcp_frame, tcp_stream_pair, wait_for_tcp_connect_status, write_tcp_payload, DataMode,
-        L3RemoteCommand, TcpFrameRead, TcpTunnel, TcpTunnelCommand,
+        DataMode, L3RemoteCommand, TcpFrameRead, TcpTunnel, TcpTunnelCommand,
+        configure_connected_tcp, decode_l3_data_payload, drain_l3_remote_commands, read_tcp_frame,
+        tcp_stream_pair, wait_for_tcp_connect_status, write_tcp_payload,
     };
     use socket2::SockRef;
     use std::collections::VecDeque;
     use std::io::{self, Cursor, Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::sync::atomic::AtomicBool;
-    use std::sync::{mpsc, Mutex};
+    use std::sync::{Mutex, mpsc};
 
     struct TestIo {
         input: Cursor<Vec<u8>>,
@@ -3269,9 +3263,7 @@ mod tests {
         command_tx
             .send(L3RemoteCommand::Write(vec![1, 2, 3]))
             .unwrap();
-        command_tx
-            .send(L3RemoteCommand::Write(vec![4, 5]))
-            .unwrap();
+        command_tx.send(L3RemoteCommand::Write(vec![4, 5])).unwrap();
         command_tx.send(L3RemoteCommand::Close).unwrap();
 
         let mut output = Vec::new();

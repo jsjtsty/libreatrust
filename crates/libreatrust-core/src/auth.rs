@@ -1363,9 +1363,7 @@ fn short_response_body(body: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        AuthIdItem, AuthStepData, PasswordResponse, SmsMode, auth_step_from_data,
-    };
+    use super::{AuthIdItem, AuthStepData, PasswordResponse, SmsMode, auth_step_from_data};
 
     #[test]
     fn password_captcha_response_allows_missing_ticket() {
