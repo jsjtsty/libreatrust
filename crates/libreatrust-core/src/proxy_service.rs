@@ -1,6 +1,6 @@
 use crate::client::AtrClient;
 use crate::error::{AtrError, AtrResult};
-use crate::transport::{connect_tcp_bound, TcpTunnel};
+use crate::transport::{connect_tcp_bound, L3Tunnel, TcpTunnel};
 use crate::types::RouteDecision;
 use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
@@ -55,6 +55,7 @@ pub struct ProxyService {
     worker: Mutex<Option<thread::JoinHandle<()>>>,
     connections: Arc<Mutex<Vec<thread::JoinHandle<()>>>>,
     active_sockets: Arc<Mutex<HashMap<u64, TcpStream>>>,
+    keepalive_l3: Mutex<Option<L3Tunnel>>,
 }
 
 impl ProxyService {
@@ -77,6 +78,20 @@ impl ProxyService {
         let last_event = Arc::new(Mutex::new(None));
         let connections = Arc::new(Mutex::new(Vec::new()));
         let active_sockets = Arc::new(Mutex::new(HashMap::new()));
+        let keepalive_l3 = match client.open_l3_tunnel() {
+            Ok(tunnel) => {
+                crate::diag_log(
+                    "[libreatrust][proxy] dedicated L3 keepalive tunnel started".to_string(),
+                );
+                Some(tunnel)
+            }
+            Err(error) => {
+                crate::diag_log(format!(
+                    "[libreatrust][proxy] dedicated L3 keepalive unavailable error={error}"
+                ));
+                None
+            }
+        };
 
         let worker_stop = stop.clone();
         let worker_active = active_connections.clone();
@@ -119,6 +134,7 @@ impl ProxyService {
             worker: Mutex::new(Some(worker)),
             connections,
             active_sockets,
+            keepalive_l3: Mutex::new(keepalive_l3),
         })
     }
 
@@ -134,6 +150,12 @@ impl ProxyService {
         let connections = std::mem::take(&mut *self.connections.lock().unwrap());
         for connection in connections {
             let _ = connection.join();
+        }
+        if let Some(tunnel) = self.keepalive_l3.lock().unwrap().take() {
+            let _ = tunnel.close();
+            crate::diag_log(
+                "[libreatrust][proxy] dedicated L3 keepalive tunnel stopped".to_string(),
+            );
         }
         Ok(())
     }
