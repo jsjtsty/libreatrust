@@ -63,6 +63,8 @@ jobs:
             os: macos-15-intel
           - name: windows-x86_64
             os: windows-latest
+          - name: windows-arm64
+            os: windows-11-arm
 
     steps:
       - name: Check out repository
@@ -78,3 +80,35 @@ jobs:
 
       - name: Build release artifacts
         run: cargo build --workspace --release --locked
+
+      - name: Package Unix artifacts
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "dist/libreatrust-${{ matrix.name }}"
+          cp target/release/libreatrust.a "dist/libreatrust-${{ matrix.name }}/"
+          cp target/release/libreatrust.dylib "dist/libreatrust-${{ matrix.name }}/" 2>/dev/null || \
+            cp target/release/libreatrust.so "dist/libreatrust-${{ matrix.name }}/"
+          cp include/libreatrust.h "dist/libreatrust-${{ matrix.name }}/"
+          tar -C dist -czf "libreatrust-${{ matrix.name }}.tar.gz" "libreatrust-${{ matrix.name }}"
+
+      - name: Package Windows artifacts
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $package = "dist/libreatrust-${{ matrix.name }}"
+          New-Item -ItemType Directory -Force $package | Out-Null
+          Copy-Item target/release/libreatrust.lib $package
+          Copy-Item target/release/libreatrust.dll $package
+          Copy-Item include/libreatrust.h $package
+          Compress-Archive -Path $package -DestinationPath "libreatrust-${{ matrix.name }}.zip"
+
+      - name: Upload CI artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: libreatrust-ci-${{ matrix.name }}
+          path: |
+            libreatrust-${{ matrix.name }}.tar.gz
+            libreatrust-${{ matrix.name }}.zip
+          if-no-files-found: error

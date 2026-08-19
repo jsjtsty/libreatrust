@@ -29,6 +29,8 @@ jobs:
             os: macos-15-intel
           - name: windows-x86_64
             os: windows-latest
+          - name: windows-arm64
+            os: windows-11-arm
 
     steps:
       - name: Check out repository
