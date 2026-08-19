@@ -5,7 +5,7 @@ use crate::types::{ProtocolKind, RouteDecision};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::SignatureScheme;
-use rustls::{ClientConfig as TlsClientConfig, ClientConnection, StreamOwned};
+use rustls::{ClientConfig as TlsClientConfig, ClientConnection, RootCertStore, StreamOwned};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::Digest;
@@ -2278,16 +2278,25 @@ fn connect_tls(
     let host = addr.split(':').next().unwrap_or(addr);
     let server_name = ServerName::try_from(host.to_string())
         .map_err(|_| AtrError::InvalidArgument(format!("invalid host {host}")))?;
-    let conn = ClientConnection::new(client_tls_config(), server_name)
+    let conn = ClientConnection::new(client_tls_config(cfg.allow_insecure_tls), server_name)
         .map_err(|e| AtrError::NetworkFailed(e.to_string()))?;
     Ok(StreamOwned::new(conn, tcp))
 }
 
-pub(crate) fn client_tls_config() -> Arc<TlsClientConfig> {
+pub(crate) fn client_tls_config(allow_insecure_tls: bool) -> Arc<TlsClientConfig> {
+    if allow_insecure_tls {
+        return Arc::new(
+            TlsClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoVerifier))
+                .with_no_client_auth(),
+        );
+    }
+
+    let root_store = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     Arc::new(
         TlsClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(NoVerifier))
+            .with_root_certificates(root_store)
             .with_no_client_auth(),
     )
 }

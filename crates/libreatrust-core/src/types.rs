@@ -22,7 +22,7 @@ impl Default for ClientConfig {
             connect_timeout_ms: 20_000,
             io_timeout_ms: 20_000,
             node_probe_timeout_ms: 3_000,
-            allow_insecure_tls: true,
+            allow_insecure_tls: false,
             bind_interface: None,
             auto_detect_interface: true,
         }
@@ -71,7 +71,7 @@ impl Default for AuthConfig {
             login_domain: String::new(),
             preferred_auth_type: None,
             io_timeout_ms: 20_000,
-            allow_insecure_tls: true,
+            allow_insecure_tls: false,
         }
     }
 }
