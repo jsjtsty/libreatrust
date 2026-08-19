@@ -1,65 +1,81 @@
 # libreatrust
 
-Rust SDK and ABI layer for the transport core.
+[![CI](https://github.com/jsjtsty/libreatrust/actions/workflows/ci.yml/badge.svg)](https://github.com/jsjtsty/libreatrust/actions/workflows/ci.yml)
+[![License: AGPL v3](https://img.shields.io/badge/License-AGPLv3-blue.svg)](LICENSE.txt)
 
-## What it provides
+`libreatrust` is a Rust library and C-compatible ABI layer for secure access clients. It contains the protocol, authentication, resource, routing, and transport logic that can be shared by native desktop applications and other language runtimes.
 
-- Resource parsing and route decisions
-- Session material management
-- A state-driven auth flow with no UI or WebView hosting
+## Scope
+
+The library provides:
+
+- Authentication state machines for password, SMS, captcha, and callback flows
+- Session material import, export, resumption, and lifecycle management
+- Client resource parsing and snapshot access
+- Managed-domain and managed-IP route decisions
 - TCP, UDP, and L3 tunnel primitives
-- A C ABI for Kotlin, Swift, C++, and other runtimes
-- Resource snapshot getters for raw bytes, DNS, node groups, route lists, and VIPs
-- Login helpers for callback flows and post-login client resource fetch
-- A cancellable session KeepAlive service using remote DNS or a configured HTTP URL
+- Proxy service primitives with event and traffic statistics
+- DNS and node-group resource access
+- C ABI bindings for Swift, Kotlin, C/C++, and other FFI consumers
 
-## Output artifacts
+The library does not provide a login UI, WebView hosting, or platform-specific user-interface orchestration. Those responsibilities belong to the integrating application.
 
-- `cdylib` for `so` / `dylib` / `dll`
-- `staticlib` for static linking
-- `include/libreatrust.h` as the public C header
+## Transport lifecycle and keepalive
 
-## ABI design
+L3 tunnel transport maintenance is managed inside the transport implementation. An active L3 tunnel maintains its protocol heartbeat and can run the configured business-level ICMP keepalive when an appropriate managed target is available. The proxy service can create a dedicated L3 session for this purpose and closes it together with the proxy service.
 
-- Prefix: `atr_`
-- Input strings are borrowed `const char *`
-- Returned strings, blobs, and lists are owned by the caller after return
-- Free returned values with the matching `*_free()` function
-- Opaque handles are used for clients and tunnels
-- Auth returns plain C structs, so upper layers can own UX and platform-specific adaptation
-- UDP tunnel APIs mirror the TCP shape: open, read, write, close, free
-- Resource snapshots can be exported without re-parsing internal formats on the upper layer
-- Callback login can pre-set device identity before finishing the flow
-- KeepAlive is an independent service: start it after authentication and resource loading, and stop it before disconnecting
+This keeps transport maintenance close to the tunnel lifecycle and avoids requiring upper layers to coordinate a separate KeepAlive API.
 
-## KeepAlive
+## C ABI
 
-`KeepAliveService` sends a probe immediately and then at the configured interval (60 seconds by default).
-With no URL it sends a DNS query through the configured remote DNS resource. Set `KeepAliveConfig::url` to
-an `http://` or `https://` endpoint that is available through the managed resources to use an HTTP probe.
-HTTPS is terminated with rustls inside the library while the underlying TCP connection remains managed.
+The generated public header is available at [`include/libreatrust.h`](include/libreatrust.h). The ABI follows these conventions:
 
-The service is intentionally separate from `ProxyService`, so applications that use raw tunnels can use the
-same session protection. It must be stopped by the caller when the authenticated client is disconnected.
+- Functions use the `atr_` prefix.
+- Input strings and buffers are borrowed for the duration of the call.
+- Returned strings, buffers, lists, and structures are released with their matching `*_free` function.
+- Clients and tunnels are represented by opaque handles.
+- Authentication and resource data are returned as plain C structures for platform-specific adaptation.
 
-## Auth model
-
-This library does not host a login UI and does not implement WebView orchestration.
-
-The auth session is a pure state machine:
-
-- request available methods
-- start password or SMS login
-- receive captcha or SMS code challenges as C structs
-- complete callback flows by providing the callback URL payload
-- import/export session material
+See [`examples/c_api_smoke.c`](examples/c_api_smoke.c) for a minimal C integration example.
 
 ## Build
 
+Build the Rust workspace and all release library formats:
+
 ```bash
-cargo build --release
+cargo build --workspace --release --locked
 ```
 
-## C example
+The release build produces:
 
-See `examples/c_api_smoke.c`.
+- `cdylib`: `dylib` on macOS, `so` on Linux, and `dll` on Windows
+- `staticlib`: static-linking library for supported targets
+- `include/libreatrust.h`: public C header
+
+Run the local checks with:
+
+```bash
+cargo fmt --all -- --check
+cargo check --workspace --all-targets --locked
+cargo test --workspace --all-targets --locked
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+```
+
+## Release artifacts
+
+GitHub Actions builds and uploads artifacts for:
+
+- Linux x86_64 and arm64
+- macOS arm64 and x86_64
+- Windows x86_64 and arm64
+
+Version tags create GitHub Releases containing platform-specific archives. Consumers that need the C ABI should use the archive matching their target platform and architecture.
+
+## Related projects
+
+- [NulConnect](https://github.com/jsjtsty/NulConnect) — macOS client
+- [nulconnect-helper](https://github.com/jsjtsty/nulconnect-helper) — privileged platform helper
+
+## License
+
+`libreatrust` is licensed under the GNU Affero General Public License v3.0. See [LICENSE.txt](LICENSE.txt).
