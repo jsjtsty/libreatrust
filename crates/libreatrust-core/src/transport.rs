@@ -16,7 +16,7 @@ use std::env;
 use std::ffi::CStr;
 use std::fmt;
 use std::io::{BufReader, ErrorKind, Read, Write};
-use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
 #[cfg(target_family = "unix")]
 use std::os::fd::FromRawFd;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -2283,12 +2283,34 @@ fn connect_tls(
         cfg,
     )?;
     tcp.set_write_timeout(Some(Duration::from_millis(cfg.io_timeout_ms)))?;
-    let host = addr.split(':').next().unwrap_or(addr);
-    let server_name = ServerName::try_from(host.to_string())
-        .map_err(|_| AtrError::InvalidArgument(format!("invalid host {host}")))?;
+    let tls_host = tls_server_name_for(addr, cfg)?;
+    let server_name = ServerName::try_from(tls_host.clone())
+        .map_err(|_| AtrError::InvalidArgument(format!("invalid TLS server name {tls_host}")))?;
     let conn = ClientConnection::new(client_tls_config(cfg.allow_insecure_tls), server_name)
         .map_err(|e| AtrError::NetworkFailed(e.to_string()))?;
     Ok(StreamOwned::new(conn, tcp))
+}
+
+fn tls_server_name_for(addr: &str, cfg: &crate::types::ClientConfig) -> AtrResult<String> {
+    let host = if let Ok(socket_addr) = addr.parse::<SocketAddr>() {
+        socket_addr.ip().to_string()
+    } else {
+        addr.rsplit_once(':')
+            .map(|(host, _)| host.trim_matches(['[', ']']))
+            .unwrap_or(addr)
+            .to_string()
+    };
+
+    if host.parse::<IpAddr>().is_ok() {
+        if cfg.server_host.is_empty() {
+            return Err(AtrError::InvalidArgument(
+                "server_host is required for IP TLS endpoints".into(),
+            ));
+        }
+        Ok(cfg.server_host.clone())
+    } else {
+        Ok(host)
+    }
 }
 
 pub(crate) fn client_tls_config(allow_insecure_tls: bool) -> Arc<TlsClientConfig> {
@@ -3145,7 +3167,7 @@ mod tests {
     use super::{
         DataMode, L3RemoteCommand, TcpFrameRead, TcpTunnel, TcpTunnelCommand,
         configure_connected_tcp, decode_l3_data_payload, drain_l3_remote_commands, read_tcp_frame,
-        tcp_stream_pair, wait_for_tcp_connect_status, write_tcp_payload,
+        tcp_stream_pair, tls_server_name_for, wait_for_tcp_connect_status, write_tcp_payload,
     };
     use socket2::SockRef;
     use std::collections::VecDeque;
@@ -3181,6 +3203,23 @@ mod tests {
             input: Cursor::new(vec![0x53, 0x00, 0x00, 0x02, b'O', b'K', 0x05, status]),
             output: Vec::new(),
         }
+    }
+
+    #[test]
+    fn uses_configured_host_for_ip_tls_endpoint() {
+        let config = crate::types::ClientConfig {
+            server_host: "ivpn.hit.edu.cn".into(),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            tls_server_name_for("202.118.253.228:441", &config).unwrap(),
+            "ivpn.hit.edu.cn"
+        );
+        assert_eq!(
+            tls_server_name_for("node.hit.edu.cn:441", &config).unwrap(),
+            "node.hit.edu.cn"
+        );
     }
 
     #[test]
