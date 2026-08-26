@@ -180,13 +180,11 @@ pub fn parse_resource_bytes(resource: &[u8], service_host: &str) -> AtrResult<Re
                     }
                 }
 
-                if !addr.ip.is_empty() {
-                    if is_domain_like(&addr.host) {
-                        for ip_str in addr.ip {
-                            if let Ok(ip) = ip_str.parse::<Ipv4Addr>() {
-                                snapshot.dns_resource.insert(addr.host.clone(), ip);
-                                break;
-                            }
+                if !addr.ip.is_empty() && is_domain_like(&addr.host) {
+                    for ip_str in addr.ip {
+                        if let Ok(ip) = ip_str.parse::<Ipv4Addr>() {
+                            snapshot.dns_resource.insert(addr.host.clone(), ip);
+                            break;
                         }
                     }
                 }
@@ -352,13 +350,13 @@ fn ports_match(port_min: u16, port_max: u16, port: u16, protocol: ProtocolKind) 
 }
 
 fn protocol_matches(rule: &str, protocol: ProtocolKind) -> bool {
-    match (rule, protocol) {
-        ("all", _) => true,
-        ("tcp", ProtocolKind::Tcp) => true,
-        ("udp", ProtocolKind::Udp) => true,
-        ("icmp", ProtocolKind::Icmp) => true,
-        _ => false,
-    }
+    matches!(
+        (rule, protocol),
+        ("all", _)
+            | ("tcp", ProtocolKind::Tcp)
+            | ("udp", ProtocolKind::Udp)
+            | ("icmp", ProtocolKind::Icmp)
+    )
 }
 
 fn parse_port_range(port: &str) -> AtrResult<(u16, u16)> {

@@ -43,6 +43,11 @@ jobs:
       - name: Run tests
         run: cargo test --workspace --all-targets --locked
 
+      - name: Compile C smoke example
+        run: |
+          cargo build --workspace --locked
+          cc examples/c_api_smoke.c -o target/c_api_smoke -Iinclude -Ltarget/debug -lreatrust
+
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 

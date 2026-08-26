@@ -20,7 +20,7 @@ use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpStream, ToSocketAddrs}
 #[cfg(target_family = "unix")]
 use std::os::fd::FromRawFd;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, mpsc};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -116,13 +116,12 @@ impl TcpTunnel {
         let mut copied = 0usize;
         {
             let mut cached = self.read_buf.lock().unwrap();
-            while copied < buf.len() {
-                if let Some(b) = cached.pop_front() {
-                    buf[copied] = b;
-                    copied += 1;
-                } else {
-                    break;
-                }
+            if !cached.is_empty() {
+                let pending = cached.make_contiguous();
+                let take = pending.len().min(buf.len());
+                buf[..take].copy_from_slice(&pending[..take]);
+                cached.drain(..take);
+                copied = take;
             }
             if copied > 0 || copied == buf.len() {
                 return Ok(copied);
@@ -140,7 +139,7 @@ impl TcpTunnel {
 
         if direct < data.len() {
             let mut cached = self.read_buf.lock().unwrap();
-            cached.extend(data[direct..].iter().copied());
+            cached.extend(&data[direct..]);
         }
         Ok(copied)
     }
@@ -192,12 +191,21 @@ fn run_tcp_tunnel_worker(
     write_rx: mpsc::Receiver<TcpTunnelCommand>,
     mut wake_rx: TcpStream,
 ) {
+    let mut event_source = match TcpTunnelEventSource::new(&stream.sock, &wake_rx) {
+        Ok(event_source) => event_source,
+        Err(error) => {
+            let _ = incoming_tx.send(Err(error));
+            let _ = stream.sock.shutdown(Shutdown::Both);
+            return;
+        }
+    };
+
     loop {
         if !drain_tcp_tunnel_commands(&mut stream, &write_rx) {
             return;
         }
 
-        let event = match wait_for_tcp_tunnel_event(&stream.sock, &wake_rx) {
+        let event = match event_source.wait() {
             Ok(event) => event,
             Err(error) => {
                 let _ = incoming_tx.send(Err(error));
@@ -213,10 +221,8 @@ fn run_tcp_tunnel_worker(
             }
         }
 
-        if event.socket_readable {
-            if !drain_tcp_tunnel_frames(&mut stream, &incoming_tx) {
-                return;
-            }
+        if event.socket_readable && !drain_tcp_tunnel_frames(&mut stream, &incoming_tx) {
+            return;
         }
     }
 }
@@ -288,24 +294,59 @@ struct TcpTunnelEvent {
     wake_readable: bool,
 }
 
-fn wait_for_tcp_tunnel_event(socket: &TcpStream, wake: &TcpStream) -> AtrResult<TcpTunnelEvent> {
-    use mio::event::Event;
-    use mio::net::TcpStream as MioTcpStream;
-    use mio::{Events, Interest, Poll, Token};
+// Built once per tunnel worker: recreating the poll for every event would
+// cost a fresh epoll/kqueue instance plus two fd dups per readiness
+// notification. The registered streams must be kept alive for the lifetime
+// of the source: registration does not own the fds, and dropping them would
+// leave the poll watching closed descriptors.
+struct TcpTunnelEventSource {
+    poll: mio::Poll,
+    // Kept only to keep the registered descriptors open; kqueue events are
+    // read from `poll`, never from these handles.
+    _socket: mio::net::TcpStream,
+    _wake: mio::net::TcpStream,
+    events: mio::Events,
+}
 
-    let mut socket = MioTcpStream::from_std(socket.try_clone()?);
-    let mut wake = MioTcpStream::from_std(wake.try_clone()?);
-    let mut poll = Poll::new().map_err(AtrError::from)?;
-    poll.registry()
-        .register(&mut socket, Token(0), Interest::READABLE)?;
-    poll.registry()
-        .register(&mut wake, Token(1), Interest::READABLE)?;
-    let mut events = Events::with_capacity(2);
-    poll.poll(&mut events, None).map_err(AtrError::from)?;
-    Ok(TcpTunnelEvent {
-        socket_readable: events.iter().any(|event: &Event| event.token() == Token(0)),
-        wake_readable: events.iter().any(|event: &Event| event.token() == Token(1)),
-    })
+impl TcpTunnelEventSource {
+    fn new(socket: &TcpStream, wake: &TcpStream) -> AtrResult<Self> {
+        use mio::net::TcpStream as MioTcpStream;
+        use mio::{Interest, Poll, Token};
+
+        let mut socket = MioTcpStream::from_std(socket.try_clone()?);
+        let mut wake = MioTcpStream::from_std(wake.try_clone()?);
+        let poll = Poll::new().map_err(AtrError::from)?;
+        poll.registry()
+            .register(&mut socket, Token(0), Interest::READABLE)?;
+        poll.registry()
+            .register(&mut wake, Token(1), Interest::READABLE)?;
+        Ok(Self {
+            poll,
+            _socket: socket,
+            _wake: wake,
+            events: mio::Events::with_capacity(2),
+        })
+    }
+
+    fn wait(&mut self) -> AtrResult<TcpTunnelEvent> {
+        use mio::Token;
+        use mio::event::Event;
+
+        self.events.clear();
+        self.poll
+            .poll(&mut self.events, None)
+            .map_err(AtrError::from)?;
+        Ok(TcpTunnelEvent {
+            socket_readable: self
+                .events
+                .iter()
+                .any(|event: &Event| event.token() == Token(0)),
+            wake_readable: self
+                .events
+                .iter()
+                .any(|event: &Event| event.token() == Token(1)),
+        })
+    }
 }
 
 fn drain_wake_stream(wake_rx: &mut TcpStream) {
@@ -362,13 +403,16 @@ pub(crate) fn connect_tcp_bound(
         .transpose()?
         .flatten();
     let auto_detect = manual_index.is_none() && config.auto_detect_interface;
-    let selected_index =
-        manual_index.or_else(|| auto_detect.then(|| default_interface_index(addr)).flatten());
+    let selected_index = manual_index.or_else(|| {
+        auto_detect
+            .then(|| cached_default_interface_index(addr))
+            .flatten()
+    });
     let result = connect_tcp_bound_once(addr, timeout, selected_index);
     if result.is_ok() || !auto_detect {
         return result.and_then(configure_connected_tcp);
     }
-    let refreshed_index = default_interface_index(addr);
+    let refreshed_index = refresh_default_interface_index(addr);
     if refreshed_index == selected_index {
         return result;
     }
@@ -593,14 +637,57 @@ fn set_bound_interface(
     Ok(())
 }
 
-#[cfg(target_family = "unix")]
-fn default_physical_interface_index(addr: &SocketAddr) -> Option<u32> {
-    route_default_physical_interface(addr).or_else(|| active_physical_interface(addr))
+const DEFAULT_INTERFACE_CACHE_TTL: Duration = Duration::from_secs(30);
+
+#[derive(Debug, Default)]
+struct DefaultInterfaceCache {
+    v4: Option<(u32, Instant)>,
+    v6: Option<(u32, Instant)>,
+}
+
+static DEFAULT_INTERFACE_CACHE: LazyLock<Mutex<DefaultInterfaceCache>> =
+    LazyLock::new(|| Mutex::new(DefaultInterfaceCache::default()));
+
+// Resolving the default interface costs a /sbin/route subprocess on Unix,
+// so reuse the answer for a short window instead of doing it per connection.
+fn cached_default_interface_index(addr: &SocketAddr) -> Option<u32> {
+    {
+        let cache = DEFAULT_INTERFACE_CACHE.lock().unwrap();
+        let cached = match addr {
+            SocketAddr::V4(_) => cache.v4,
+            SocketAddr::V6(_) => cache.v6,
+        };
+        if let Some((index, refreshed)) = cached
+            && refreshed.elapsed() < DEFAULT_INTERFACE_CACHE_TTL
+        {
+            return Some(index);
+        }
+    }
+    let index = compute_default_interface_index(addr)?;
+    store_default_interface_index(addr, index);
+    Some(index)
+}
+
+// Bypass the cache after a failed connect so a route change is picked up on
+// the immediate retry.
+fn refresh_default_interface_index(addr: &SocketAddr) -> Option<u32> {
+    let index = compute_default_interface_index(addr)?;
+    store_default_interface_index(addr, index);
+    Some(index)
+}
+
+fn store_default_interface_index(addr: &SocketAddr, index: u32) {
+    let mut cache = DEFAULT_INTERFACE_CACHE.lock().unwrap();
+    let slot = match addr {
+        SocketAddr::V4(_) => &mut cache.v4,
+        SocketAddr::V6(_) => &mut cache.v6,
+    };
+    *slot = Some((index, Instant::now()));
 }
 
 #[cfg(target_family = "unix")]
-fn default_interface_index(addr: &SocketAddr) -> Option<u32> {
-    default_physical_interface_index(addr)
+fn compute_default_interface_index(addr: &SocketAddr) -> Option<u32> {
+    route_default_physical_interface(addr).or_else(|| active_physical_interface(addr))
 }
 
 #[cfg(target_family = "unix")]
@@ -690,7 +777,7 @@ fn interface_index_by_name(name: &str) -> AtrResult<Option<u32>> {
 }
 
 #[cfg(target_os = "windows")]
-fn default_interface_index(_addr: &SocketAddr) -> Option<u32> {
+fn compute_default_interface_index(_addr: &SocketAddr) -> Option<u32> {
     let adapters = windows_adapters().ok()?;
     adapters
         .iter()
@@ -749,17 +836,18 @@ fn active_physical_interface(addr: &SocketAddr) -> Option<u32> {
                 let name = unsafe { CStr::from_ptr(ifaddr.ifa_name) }
                     .to_string_lossy()
                     .into_owned();
-                if is_physical_interface_name(&name) {
-                    if let Ok(c_name) = std::ffi::CString::new(name.as_str()) {
-                        let index = unsafe { libc::if_nametoindex(c_name.as_ptr()) };
-                        if index != 0 {
-                            let score = physical_interface_score(&name);
-                            if best
-                                .as_ref()
-                                .map_or(true, |(best_score, _, _)| score > *best_score)
-                            {
-                                best = Some((score, index, name));
-                            }
+                if is_physical_interface_name(&name)
+                    && let Ok(c_name) = std::ffi::CString::new(name.as_str())
+                {
+                    let index = unsafe { libc::if_nametoindex(c_name.as_ptr()) };
+                    if index != 0 {
+                        let score = physical_interface_score(&name);
+                        let is_best = match best.as_ref() {
+                            None => true,
+                            Some((best_score, _, _)) => score > *best_score,
+                        };
+                        if is_best {
+                            best = Some((score, index, name));
                         }
                     }
                 }
@@ -1430,7 +1518,7 @@ impl L3Tunnel {
         if self.state.close_flag.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
-        crate::diag_log("[libreatrust][l3] tunnel close requested".to_string());
+        crate::diag_log("[libreatrust][l3] tunnel close requested");
         if let Some(worker) = self.business_keepalive_worker.lock().unwrap().take() {
             let _ = worker.join();
         }
@@ -1445,7 +1533,7 @@ impl L3Tunnel {
         for remote in remotes {
             remote.close();
         }
-        crate::diag_log("[libreatrust][l3] tunnel close completed".to_string());
+        crate::diag_log("[libreatrust][l3] tunnel close completed");
         Ok(())
     }
 
@@ -1509,9 +1597,7 @@ fn business_keepalive_loop(state: Arc<L3TunnelState>) {
         .resource()
         .map(|resource| resource.major_node_group.clone())
     else {
-        crate::diag_log(
-            "[libreatrust][l3] business keepalive disabled: resource not set".to_string(),
-        );
+        crate::diag_log("[libreatrust][l3] business keepalive disabled: resource not set");
         return;
     };
 
@@ -1527,8 +1613,7 @@ fn business_keepalive_loop(state: Arc<L3TunnelState>) {
 
     let Some(target) = select_icmp_keepalive_target(&state.client) else {
         crate::diag_log(
-            "[libreatrust][l3] business keepalive disabled: no managed IPv4 ICMP target"
-                .to_string(),
+            "[libreatrust][l3] business keepalive disabled: no managed IPv4 ICMP target",
         );
         return;
     };
@@ -1551,7 +1636,7 @@ fn business_keepalive_loop(state: Arc<L3TunnelState>) {
         sequence = sequence.wrapping_add(1);
         sleep_until_keepalive(&state.close_flag, L3_BUSINESS_KEEPALIVE_INTERVAL);
     }
-    crate::diag_log("[libreatrust][l3] business keepalive stopped".to_string());
+    crate::diag_log("[libreatrust][l3] business keepalive stopped");
 }
 
 fn send_icmp_keepalive(
@@ -1885,12 +1970,12 @@ impl L3Remote {
             let _ = self.command_tx.send(L3RemoteCommand::Close);
             self.wake_worker();
         }
-        if let Some(worker) = self.worker.lock().unwrap().take() {
-            if worker.join().is_err() {
-                crate::diag_log("[libreatrust][l3] remote worker join failed".to_string());
-            }
+        if let Some(worker) = self.worker.lock().unwrap().take()
+            && worker.join().is_err()
+        {
+            crate::diag_log("[libreatrust][l3] remote worker join failed");
         }
-        crate::diag_log("[libreatrust][l3] remote close completed".to_string());
+        crate::diag_log("[libreatrust][l3] remote close completed");
     }
 
     fn write_packet(
@@ -1916,7 +2001,7 @@ impl L3Remote {
 
     fn send_heartbeat(&self) -> AtrResult<()> {
         self.enqueue_payload(vec![0x05, 0x15, 0x00, 0x00])?;
-        crate::diag_log("[libreatrust][l3] keep-alive heartbeat sent".to_string());
+        crate::diag_log("[libreatrust][l3] keep-alive heartbeat sent");
         Ok(())
     }
 
@@ -1984,7 +2069,7 @@ fn authenticate_l3_stream(
 ) -> AtrResult<()> {
     let req = serde_json::to_vec(&json!({ "sid": info.sid }))?;
     let packet = wrap_auth_req_data(&req, 1);
-    crate::diag_log("[libreatrust][l3] tunnel auth send sid".to_string());
+    crate::diag_log("[libreatrust][l3] tunnel auth send sid");
     stream.write_all(&packet)?;
     stream.flush()?;
 
@@ -2059,7 +2144,7 @@ fn authenticate_l3_stream(
             }
         }
     }
-    crate::diag_log("[libreatrust][l3] tunnel auth ready".to_string());
+    crate::diag_log("[libreatrust][l3] tunnel auth ready");
     Ok(())
 }
 
@@ -2098,7 +2183,7 @@ fn run_l3_remote_worker(
     };
     conntracks.fail_pending(failure);
     let _ = stream.socket().shutdown(Shutdown::Both);
-    crate::diag_log("[libreatrust][l3] I/O worker stopped".to_string());
+    crate::diag_log("[libreatrust][l3] I/O worker stopped");
 }
 
 fn run_l3_remote_worker_inner(
@@ -2132,7 +2217,7 @@ fn run_l3_remote_worker_inner(
         if Instant::now() >= next_heartbeat {
             stream.write_all(&[0x05, 0x15, 0x00, 0x00])?;
             stream.flush()?;
-            crate::diag_log("[libreatrust][l3] I/O worker sent heartbeat".to_string());
+            crate::diag_log("[libreatrust][l3] I/O worker sent heartbeat");
             next_heartbeat = Instant::now() + L3_PROTOCOL_HEARTBEAT_INTERVAL;
         }
 
@@ -3165,16 +3250,20 @@ impl fmt::Display for PacketMeta {
 #[cfg(test)]
 mod tests {
     use super::{
-        DataMode, L3RemoteCommand, TcpFrameRead, TcpTunnel, TcpTunnelCommand,
-        configure_connected_tcp, decode_l3_data_payload, drain_l3_remote_commands, read_tcp_frame,
-        tcp_stream_pair, tls_server_name_for, wait_for_tcp_connect_status, write_tcp_payload,
+        AtrClient, DataMode, L3RemoteCommand, TcpFrameRead, TcpTunnel, TcpTunnelCommand,
+        cached_default_interface_index, compute_default_interface_index, configure_connected_tcp,
+        decode_l3_data_payload, drain_l3_remote_commands, read_tcp_frame,
+        refresh_default_interface_index, store_default_interface_index, tcp_stream_pair,
+        tls_server_name_for, wait_for_tcp_connect_status, write_tcp_payload,
     };
+    use crate::resource::{IpResource, ResourceSnapshot};
+    use crate::types::{ClientConfig, SessionMaterial};
     use socket2::SockRef;
     use std::collections::VecDeque;
     use std::io::{self, Cursor, Read, Write};
-    use std::net::{TcpListener, TcpStream};
+    use std::net::{Ipv6Addr, SocketAddr, TcpListener, TcpStream};
     use std::sync::atomic::AtomicBool;
-    use std::sync::{Mutex, mpsc};
+    use std::sync::{Arc, Mutex, mpsc};
 
     struct TestIo {
         input: Cursor<Vec<u8>>,
@@ -3393,5 +3482,157 @@ mod tests {
         assert!(stream.nodelay().unwrap());
         assert!(SockRef::from(&stream).keepalive().unwrap());
         drop(peer);
+    }
+
+    #[test]
+    fn default_interface_index_cache_is_family_scoped() {
+        let v4 = SocketAddr::from(([127u8, 0, 0, 1], 443));
+        let v6 = SocketAddr::from((Ipv6Addr::LOCALHOST, 443));
+        store_default_interface_index(&v4, 42);
+        assert_eq!(cached_default_interface_index(&v4), Some(42));
+        assert_ne!(cached_default_interface_index(&v6), Some(42));
+        let real = compute_default_interface_index(&v4);
+        refresh_default_interface_index(&v4);
+        assert_eq!(cached_default_interface_index(&v4), real.or(Some(42)));
+    }
+
+    #[test]
+    fn tcp_tunnel_read_drains_cached_frames_across_small_buffers() {
+        let (incoming_tx, incoming_rx) = mpsc::channel();
+        for frame in [0..1000u32, 1000..2000] {
+            let data: Vec<u8> = frame.map(|n| (n % 251) as u8).collect();
+            incoming_tx.send(Ok(data)).unwrap();
+        }
+        let (write_tx, _write_rx) = mpsc::channel();
+        let (_wake_rx, wake_tx) = tcp_stream_pair().unwrap();
+        let tunnel = TcpTunnel {
+            incoming_rx: Mutex::new(incoming_rx),
+            write_tx,
+            wake_tx: Mutex::new(wake_tx),
+            read_buf: Mutex::new(VecDeque::new()),
+            closed: AtomicBool::new(false),
+            worker: Mutex::new(None),
+        };
+
+        let mut collected = Vec::new();
+        let mut chunk = [0u8; 257];
+        while collected.len() < 2000 {
+            let read = tunnel.read(&mut chunk).unwrap();
+            assert!(
+                read > 0,
+                "read stalled with {} bytes collected",
+                collected.len()
+            );
+            collected.extend_from_slice(&chunk[..read]);
+        }
+        drop(tunnel);
+
+        for (index, byte) in collected.iter().enumerate() {
+            assert_eq!(
+                *byte,
+                (index as u32 % 251) as u8,
+                "byte mismatch at {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn tcp_tunnel_worker_exchanges_data_through_fake_tls_node() {
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let node_port = listener.local_addr().unwrap().port();
+        let node = std::thread::spawn(move || {
+            let (tcp, _) = listener.accept().unwrap();
+            let key_pair = rcgen::KeyPair::generate().unwrap();
+            let params = rcgen::CertificateParams::new(vec!["fake-node".into()]).unwrap();
+            let cert = params.self_signed(&key_pair).unwrap();
+            let chain = vec![CertificateDer::from(cert.der().to_vec())];
+            let key = PrivateKeyDer::try_from(key_pair.serialize_der()).unwrap();
+            let server = rustls::ServerConnection::new(Arc::new(
+                rustls::ServerConfig::builder()
+                    .with_no_client_auth()
+                    .with_single_cert(chain, key)
+                    .unwrap(),
+            ))
+            .unwrap();
+            let mut tls = rustls::StreamOwned::new(server, tcp);
+
+            let mut init_header = [0u8; 5];
+            tls.read_exact(&mut init_header).unwrap();
+            assert_eq!(&init_header, &[0x05, 0x01, 0x81, 0x53, 0x03]);
+            let mut len = [0u8; 2];
+            tls.read_exact(&mut len).unwrap();
+            let init_len = u16::from_be_bytes(len) as usize;
+            let mut init = vec![0u8; init_len];
+            tls.read_exact(&mut init).unwrap();
+            let init_text = String::from_utf8_lossy(&init);
+            assert!(init_text.contains("\"sid\":\"sid-1\""), "{init_text}");
+
+            let mut dest = [0u8; 10];
+            tls.read_exact(&mut dest).unwrap();
+            assert_eq!(&dest[..], [0x05, 0x01, 0x01, 0x01, 10, 99, 0, 1, 1, 187]);
+
+            tls.write_all(&[0x53, 0x00, 0x00, 0x02, b'O', b'K'])
+                .unwrap();
+            let mut go = [0u8; 4];
+            tls.read_exact(&mut go).unwrap();
+            assert_eq!(&go, &[0x01, 0x00, 0x00, 0x00]);
+            tls.write_all(&[0x05, 0x00]).unwrap();
+
+            tls.write_all(&[0x01, 0x00, 0x00, 0x05]).unwrap();
+            tls.write_all(b"hello").unwrap();
+            let mut frame = [0u8; 4];
+            tls.read_exact(&mut frame).unwrap();
+            assert_eq!(&frame, &[0x01, 0x00, 0x00, 0x05]);
+            let mut payload = [0u8; 5];
+            tls.read_exact(&mut payload).unwrap();
+            assert_eq!(&payload, b"world");
+            let mut close = [0u8; 4];
+            tls.read_exact(&mut close).unwrap();
+            assert_eq!(&close, &[0x01, 0x01, 0x00, 0x00]);
+        });
+
+        let mut snapshot = ResourceSnapshot::default();
+        snapshot.ip_resources.push(IpResource {
+            ip_min: "10.99.0.1".parse().unwrap(),
+            ip_max: "10.99.0.1".parse().unwrap(),
+            port_min: 443,
+            port_max: 443,
+            protocol: "tcp".into(),
+            app_id: "app".into(),
+            node_group_id: "group".into(),
+        });
+        snapshot
+            .best_nodes
+            .insert("group".into(), format!("127.0.0.1:{node_port}"));
+
+        let mut client = AtrClient::new(ClientConfig {
+            server_host: "127.0.0.1".into(),
+            server_port: 443,
+            connect_timeout_ms: 5000,
+            io_timeout_ms: 5000,
+            auto_detect_interface: false,
+            allow_insecure_tls: true,
+            ..Default::default()
+        })
+        .unwrap();
+        client.set_resource(snapshot);
+        client.set_session(SessionMaterial {
+            username: "tester".into(),
+            sid: "sid-1".into(),
+            device_id: "device-1".into(),
+            connection_id: "conn-1".into(),
+            sign_key_hex: hex::encode([0u8; 32]),
+            cookies: Vec::new(),
+        });
+
+        let tunnel = TcpTunnel::connect(&client, "10.99.0.1", 443).unwrap();
+        let mut received = [0u8; 5];
+        assert_eq!(tunnel.read(&mut received).unwrap(), 5);
+        assert_eq!(&received, b"hello");
+        assert_eq!(tunnel.write(b"world").unwrap(), 5);
+        tunnel.close().unwrap();
+        node.join().unwrap();
     }
 }

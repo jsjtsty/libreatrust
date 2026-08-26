@@ -2165,3 +2165,77 @@ pub extern "C" fn atr_auth_challenge_free(challenge: *mut atr_auth_challenge_t) 
         free_challenge(&mut *challenge);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_null_client_new_arguments() {
+        let mut client = ptr::null_mut();
+        assert_eq!(
+            atr_client_new(ptr::null(), &mut client),
+            ErrorCode::InvalidArgument as i32
+        );
+        let config = atr_client_config_t {
+            server_host: c"127.0.0.1".as_ptr(),
+            server_port: 443,
+            user_agent: ptr::null(),
+            connect_timeout_ms: 5000,
+            io_timeout_ms: 5000,
+            node_probe_timeout_ms: 5000,
+            allow_insecure_tls: false,
+            bind_interface: ptr::null(),
+            auto_detect_interface: false,
+        };
+        assert_eq!(
+            atr_client_new(&config, ptr::null_mut()),
+            ErrorCode::InvalidArgument as i32
+        );
+    }
+
+    #[test]
+    fn reports_missing_server_host_in_last_error() {
+        let mut client = ptr::null_mut();
+        let config = atr_client_config_t {
+            server_host: ptr::null(),
+            server_port: 443,
+            user_agent: c"test".as_ptr(),
+            connect_timeout_ms: 5000,
+            io_timeout_ms: 5000,
+            node_probe_timeout_ms: 5000,
+            allow_insecure_tls: false,
+            bind_interface: ptr::null(),
+            auto_detect_interface: false,
+        };
+        assert_eq!(
+            atr_client_new(&config, &mut client),
+            ErrorCode::InvalidArgument as i32
+        );
+        let message = atr_last_error_message();
+        assert!(!message.is_null());
+        let message = unsafe { CStr::from_ptr(message) }.to_str().unwrap();
+        assert!(message.contains("server_host"));
+    }
+
+    #[test]
+    fn creates_and_frees_client_with_valid_config() {
+        let host = CString::new("127.0.0.1").unwrap();
+        let user_agent = CString::new("ffi-test").unwrap();
+        let config = atr_client_config_t {
+            server_host: host.as_ptr(),
+            server_port: 443,
+            user_agent: user_agent.as_ptr(),
+            connect_timeout_ms: 5000,
+            io_timeout_ms: 5000,
+            node_probe_timeout_ms: 5000,
+            allow_insecure_tls: true,
+            bind_interface: ptr::null(),
+            auto_detect_interface: false,
+        };
+        let mut client = ptr::null_mut();
+        assert_eq!(atr_client_new(&config, &mut client), ErrorCode::Ok as i32);
+        assert!(!client.is_null());
+        atr_client_free(client);
+    }
+}

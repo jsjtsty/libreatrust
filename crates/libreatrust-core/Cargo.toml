@@ -10,12 +10,6 @@ crate-type = ["rlib"]
 default = []
 verbose-logs = []
 
-[profile.release]
-lto = "thin"
-strip = "symbols"
-codegen-units = 1
-panic = "abort"
-
 [dependencies]
 base64 = "0.22"
 hex = "0.4"
@@ -43,3 +37,6 @@ windows-sys = { version = "0.61", features = [
     "Win32_NetworkManagement_Ndis",
     "Win32_Networking_WinSock",
 ] }
+
+[dev-dependencies]
+rcgen = "0.13"

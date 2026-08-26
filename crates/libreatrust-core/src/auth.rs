@@ -505,7 +505,7 @@ impl AuthSession {
         }
         self.report_env()?;
         let step = self.auth_check()?;
-        return self.continue_auth(step);
+        self.continue_auth(step)
     }
 
     fn complete_login(&mut self) -> AtrResult<AuthChallenge> {
@@ -633,7 +633,6 @@ impl AuthSession {
 
     fn auth_config_mod(&mut self) -> AtrResult<(bool, Vec<AuthMethodInfo>)> {
         self.auth_config_impl(&[("mod", "1")])
-            .map(|(is_login, methods)| (is_login, methods))
     }
 
     fn auth_config_refresh(&mut self) -> AtrResult<(bool, Vec<AuthMethodInfo>)> {
@@ -1184,12 +1183,12 @@ impl AuthSession {
             .header("x-sdp-traceid", self.trace_id())
             .send()?;
         self.capture_cookies(&response)?;
-        if response.status().is_redirection() {
-            if let Some(location) = response.headers().get("Location") {
-                let location = location.to_str().unwrap_or_default();
-                if let Some(ticket) = self.extract_ticket_from_redirect(location)? {
-                    return Ok(ticket);
-                }
+        if response.status().is_redirection()
+            && let Some(location) = response.headers().get("Location")
+        {
+            let location = location.to_str().unwrap_or_default();
+            if let Some(ticket) = self.extract_ticket_from_redirect(location)? {
+                return Ok(ticket);
             }
         }
         let ticket = callback
@@ -1361,9 +1360,23 @@ fn short_response_body(body: &[u8]) -> String {
     format!("{}...", text.chars().take(MAX_LEN).collect::<String>())
 }
 
+fn random_hex(len: usize) -> String {
+    let mut bytes = vec![0u8; len.div_ceil(2)];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    let hex = hex::encode(bytes);
+    hex[..len].to_string()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{AuthIdItem, AuthStepData, PasswordResponse, SmsMode, auth_step_from_data};
+    use super::{
+        AuthConfig, AuthIdItem, AuthSession, AuthStepData, PasswordResponse, SmsMode,
+        auth_step_from_data, parse_set_cookie, validate_client_resource_response,
+    };
+    use crate::error::AtrError;
+    use base64::Engine as _;
+    use reqwest::StatusCode;
+    use reqwest::header::HeaderValue;
 
     #[test]
     fn password_captcha_response_allows_missing_ticket() {
@@ -1403,11 +1416,124 @@ mod tests {
         });
         assert_eq!(custom.sms_mode, Some(SmsMode::Custom));
     }
-}
 
-fn random_hex(len: usize) -> String {
-    let mut bytes = vec![0u8; (len + 1) / 2];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
-    let hex = hex::encode(bytes);
-    hex[..len].to_string()
+    fn test_auth_session() -> AuthSession {
+        AuthSession::new(AuthConfig {
+            server_host: "auth.example.org".into(),
+            server_port: 443,
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn parses_set_cookie_headers() {
+        let cookie = parse_set_cookie(
+            &HeaderValue::from_static("sid=abc123; Path=/; HttpOnly"),
+            "svc.example.org",
+        )
+        .unwrap();
+        assert_eq!(cookie.name, "sid");
+        assert_eq!(cookie.value, "abc123");
+        assert_eq!(cookie.host, "svc.example.org");
+        assert_eq!(cookie.scheme, "https");
+    }
+
+    #[test]
+    fn rejects_malformed_set_cookie_headers() {
+        assert!(parse_set_cookie(&HeaderValue::from_static("no-equals-sign"), "svc").is_err());
+        let header = HeaderValue::from_bytes(b"sid=\xff\xfe").unwrap();
+        assert!(parse_set_cookie(&header, "svc").is_err());
+    }
+
+    #[test]
+    fn extracts_ticket_from_plain_redirect() {
+        let session = test_auth_session();
+        let ticket = session
+            .extract_ticket_from_redirect("https://target.example.org/home?ticket=ST-123&other=1")
+            .unwrap();
+        assert_eq!(ticket.as_deref(), Some("ST-123"));
+    }
+
+    #[test]
+    fn extracts_ticket_from_json_data_redirect() {
+        let session = test_auth_session();
+        let ticket = session
+            .extract_ticket_from_redirect(
+                "https://target.example.org/?data=%7B%22ticket%22%3A%22ST-456%22%7D",
+            )
+            .unwrap();
+        assert_eq!(ticket.as_deref(), Some("ST-456"));
+    }
+
+    #[test]
+    fn reports_missing_redirect_ticket_as_none() {
+        let session = test_auth_session();
+        let ticket = session
+            .extract_ticket_from_redirect("https://target.example.org/home?x=1")
+            .unwrap();
+        assert_eq!(ticket, None);
+    }
+
+    #[test]
+    fn rejects_invalid_redirect_location() {
+        let session = test_auth_session();
+        assert!(session.extract_ticket_from_redirect("not a url").is_err());
+    }
+
+    #[test]
+    fn accepts_client_resource_responses_with_data_or_zero_code() {
+        assert!(
+            validate_client_resource_response(StatusCode::OK, br#"{"data":{"resource":"x"}}"#)
+                .is_ok()
+        );
+        assert!(
+            validate_client_resource_response(StatusCode::OK, br#"{"code":0,"message":"ok"}"#)
+                .is_ok()
+        );
+        assert!(validate_client_resource_response(StatusCode::OK, b"not-json").is_ok());
+    }
+
+    #[test]
+    fn rejects_client_resource_business_failures() {
+        let error = validate_client_resource_response(
+            StatusCode::OK,
+            br#"{"code":500,"message":"session expired"}"#,
+        )
+        .unwrap_err();
+        assert!(matches!(error, AtrError::Unauthorized(_)));
+        let error = validate_client_resource_response(
+            StatusCode::OK,
+            br#"{"success":false,"message":"denied"}"#,
+        )
+        .unwrap_err();
+        assert!(matches!(error, AtrError::Unauthorized(_)));
+    }
+
+    #[test]
+    fn maps_client_resource_http_failures() {
+        let error = validate_client_resource_response(StatusCode::UNAUTHORIZED, b"").unwrap_err();
+        assert!(matches!(error, AtrError::Unauthorized(_)));
+        let error = validate_client_resource_response(StatusCode::INTERNAL_SERVER_ERROR, b"boom")
+            .unwrap_err();
+        assert!(matches!(error, AtrError::NetworkFailed(_)));
+    }
+
+    #[test]
+    fn builds_env_payload_and_connection_id() {
+        let session = test_auth_session();
+        let env = session.build_env("device-9");
+        let decoded = String::from_utf8(
+            base64::engine::general_purpose::STANDARD
+                .decode(env)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(decoded, r#"{"deviceId":"device-9"}"#);
+        let connection_id = session.build_connection_id("device-9");
+        let (digest, suffix) = connection_id.split_once('-').unwrap();
+        assert_eq!(digest.len(), 32);
+        assert!(digest.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(suffix.chars().all(|c| c.is_ascii_digit()));
+    }
 }
