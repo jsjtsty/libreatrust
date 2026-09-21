@@ -672,9 +672,12 @@ impl AuthSession {
         let status = resp.status();
         self.capture_cookies(&resp)?;
         let body = resp.text()?;
+        // The response body carries csrfToken and other auth-server session
+        // material, so log only enough to diagnose transport issues.
         crate::diag_log(format!(
-            "[libreatrust][auth] authConfig response status={} body={}",
-            status, body
+            "[libreatrust][auth] authConfig response status={} body_len={}",
+            status,
+            body.len()
         ));
         let parsed: AuthConfigResponse = serde_json::from_str(&body).map_err(|err| {
             crate::diag_log(format!(
@@ -857,9 +860,10 @@ impl AuthSession {
                 })
                 .unwrap_or_default();
             if !numbers.is_empty() {
+                // Phone numbers are PII; log only that some were found.
                 crate::diag_log(format!(
-                    "[libreatrust][auth] available phone numbers: {}",
-                    numbers.join(", ")
+                    "[libreatrust][auth] available phone numbers: count={}",
+                    numbers.len()
                 ));
             }
             Ok(())

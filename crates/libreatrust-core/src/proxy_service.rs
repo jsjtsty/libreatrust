@@ -729,13 +729,24 @@ fn copy_tcp_to_tcp(reader: &mut TcpStream, writer: &mut TcpStream) -> AtrResult<
     }
 }
 
+// Chunks smaller than this look like interactive traffic (keystrokes, small
+// control sequences) rather than bulk transfer, so their timing is worth
+// logging individually when hunting for stalls.
+const INTERACTIVE_CHUNK_BYTES: usize = 512;
+// A gap this long between two chunks of the same relay direction is not
+// explained by normal idle time between keystrokes; log it so a stall shows
+// up in the diagnostics log even without a debugger attached.
+const RELAY_STALL_LOG_THRESHOLD: Duration = Duration::from_millis(80);
+
 fn copy_tcp_to_tunnel(
     reader: &mut TcpStream,
     tunnel: &TcpTunnel,
     byte_counter: &AtomicU64,
 ) -> AtrResult<()> {
     let mut buf = vec![0u8; READ_BUF_SIZE];
+    let mut last_chunk_at: Option<Instant> = None;
     loop {
+        let read_start = Instant::now();
         let n = match reader.read(&mut buf) {
             Ok(0) => {
                 let _ = tunnel.close();
@@ -745,7 +756,16 @@ fn copy_tcp_to_tunnel(
             Err(err) if err.kind() == ErrorKind::Interrupted => continue,
             Err(err) => return Err(AtrError::from(err)),
         };
+        log_relay_gap("client->tunnel", n, &mut last_chunk_at);
+        let write_start = Instant::now();
         let written = tunnel.write(&buf[..n])?;
+        if n <= INTERACTIVE_CHUNK_BYTES {
+            crate::diag_log(format!(
+                "[libreatrust][proxy][relay] client->tunnel bytes={n} wait_for_read_ms={} tunnel_write_ms={}",
+                write_start.duration_since(read_start).as_millis(),
+                write_start.elapsed().as_millis()
+            ));
+        }
         byte_counter.fetch_add(written as u64, Ordering::Relaxed);
     }
 }
@@ -756,14 +776,43 @@ fn copy_tunnel_to_tcp(
     byte_counter: &AtomicU64,
 ) -> AtrResult<()> {
     let mut buf = vec![0u8; READ_BUF_SIZE];
+    let mut last_chunk_at: Option<Instant> = None;
     loop {
+        let read_start = Instant::now();
         let n = tunnel.read(&mut buf)?;
         if n == 0 {
             let _ = writer.shutdown(Shutdown::Write);
             return Ok(());
         }
+        log_relay_gap("tunnel->client", n, &mut last_chunk_at);
+        let write_start = Instant::now();
         writer.write_all(&buf[..n])?;
+        if n <= INTERACTIVE_CHUNK_BYTES {
+            crate::diag_log(format!(
+                "[libreatrust][proxy][relay] tunnel->client bytes={n} wait_for_read_ms={} client_write_ms={}",
+                write_start.duration_since(read_start).as_millis(),
+                write_start.elapsed().as_millis()
+            ));
+        }
         byte_counter.fetch_add(n as u64, Ordering::Relaxed);
+    }
+}
+
+/// Logs when the gap since the previous chunk in this direction exceeds
+/// [`RELAY_STALL_LOG_THRESHOLD`], since that is what shows up as a visible
+/// stall to an interactive session (e.g. a tmux pane switch that appears to
+/// not respond).  A gap while the peer is simply idle (no keys pressed) is
+/// normal and not logged past the first chunk.
+fn log_relay_gap(direction: &str, bytes: usize, last_chunk_at: &mut Option<Instant>) {
+    let now = Instant::now();
+    if let Some(previous) = last_chunk_at.replace(now) {
+        let gap = now.duration_since(previous);
+        if gap >= RELAY_STALL_LOG_THRESHOLD {
+            crate::diag_log(format!(
+                "[libreatrust][proxy][relay] {direction} gap_ms={} before bytes={bytes}",
+                gap.as_millis()
+            ));
+        }
     }
 }
 

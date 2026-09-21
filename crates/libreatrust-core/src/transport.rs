@@ -1771,7 +1771,6 @@ impl Drop for L3Tunnel {
 
 #[derive(Debug)]
 struct Conntrack {
-    key: String,
     auth_id: u64,
     connect_token: Mutex<Option<String>>,
     app_id: String,
@@ -1802,7 +1801,6 @@ impl ConntrackMgr {
         }
         let auth_id = self.next_auth_id.fetch_add(1, Ordering::SeqCst) + 1;
         let ct = Arc::new(Conntrack {
-            key: key.to_string(),
             auth_id,
             connect_token: Mutex::new(None),
             app_id: app_id.to_string(),
@@ -2024,9 +2022,11 @@ impl L3Remote {
             }
             let now = SystemTime::now();
             if now >= deadline {
+                // Use the opaque conntrack id rather than `ct.key`, which
+                // embeds the real destination IP:port the user is visiting.
                 return Err(AtrError::NetworkFailed(format!(
-                    "l3 auth timeout for {}",
-                    ct.key
+                    "l3 auth timeout for conntrack={}",
+                    ct.auth_id
                 )));
             }
             let remaining = deadline
@@ -2040,7 +2040,12 @@ impl L3Remote {
     fn send_auth_request(&self, ct: &Arc<Conntrack>, meta: PacketMeta) -> AtrResult<()> {
         let req = build_auth_request(&self.info, &self.sign_key, meta, ct)?;
         let packet = build_l3_auth_request_payload(&req)?;
-        crate::diag_log(format!("[libreatrust][l3] auth request key={}", ct.key));
+        // `ct.key` embeds the real destination IP:port the user is
+        // visiting; log the opaque conntrack id instead.
+        crate::diag_log(format!(
+            "[libreatrust][l3] auth request conntrack={}",
+            ct.auth_id
+        ));
         self.enqueue_payload(packet)
     }
 
