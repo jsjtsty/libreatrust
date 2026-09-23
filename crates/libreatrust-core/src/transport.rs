@@ -55,7 +55,13 @@ const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(15);
 const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 const TCP_KEEPALIVE_RETRIES: u32 = 3;
 const L3_BUSINESS_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(300);
+const L3_BUSINESS_KEEPALIVE_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 const L3_PROTOCOL_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(25);
+/// How long an L3 remote that has previously answered heartbeats may stay
+/// completely silent before it is treated as dead (a little over three missed
+/// heartbeat replies).
+const L3_LIVENESS_TIMEOUT: Duration = Duration::from_secs(80);
+const L3_HEARTBEAT_REPLY_CMD: u8 = 0x95;
 const L3_READ_BATCH_FRAMES: usize = 32;
 
 impl TcpTunnel {
@@ -1601,14 +1607,21 @@ fn business_keepalive_loop(state: Arc<L3TunnelState>) {
         return;
     };
 
-    if let Err(error) = state
+    // The network may be down when the tunnel starts (or the node briefly
+    // unreachable). Keep retrying instead of silently disabling keepalive
+    // for the whole session, which would let the server-side session expire.
+    while let Err(error) = state
         .remote_for(&node_group_id)
         .and_then(|remote| remote.send_heartbeat())
     {
         crate::diag_log(format!(
-            "[libreatrust][l3] business keepalive could not establish L3 session error={error}"
+            "[libreatrust][l3] business keepalive could not establish L3 session error={error}; retrying in {}s",
+            L3_BUSINESS_KEEPALIVE_RETRY_INTERVAL.as_secs()
         ));
-        return;
+        sleep_until_keepalive(&state.close_flag, L3_BUSINESS_KEEPALIVE_RETRY_INTERVAL);
+        if state.close_flag.load(Ordering::SeqCst) {
+            return;
+        }
     }
 
     let Some(target) = select_icmp_keepalive_target(&state.client) else {
@@ -2212,6 +2225,7 @@ fn run_l3_remote_worker_inner(
         .register(&mut wake_poll, Token(1), Interest::READABLE)?;
     let mut events = Events::with_capacity(8);
     let mut next_heartbeat = Instant::now() + L3_PROTOCOL_HEARTBEAT_INTERVAL;
+    let mut liveness = L3Liveness::new(Instant::now());
     let mut continue_reading = false;
 
     loop {
@@ -2226,12 +2240,20 @@ fn run_l3_remote_worker_inner(
             next_heartbeat = Instant::now() + L3_PROTOCOL_HEARTBEAT_INTERVAL;
         }
 
+        if liveness.is_stale(Instant::now()) {
+            return Err(AtrError::NetworkFailed(format!(
+                "l3 remote unresponsive for {}s",
+                L3_LIVENESS_TIMEOUT.as_secs()
+            )));
+        }
+
         if continue_reading {
             continue_reading = drain_l3_remote_frames(
                 stream,
                 incoming_tx,
                 conntracks,
                 vip_list,
+                &mut liveness,
                 L3_READ_BATCH_FRAMES,
             )?;
             continue;
@@ -2257,9 +2279,45 @@ fn run_l3_remote_worker_inner(
                 incoming_tx,
                 conntracks,
                 vip_list,
+                &mut liveness,
                 L3_READ_BATCH_FRAMES,
             )?;
         }
+    }
+}
+
+/// Detects an L3 remote connection that died without a socket error.
+///
+/// After Wi-Fi drops, the Mac sleeps or a NAT mapping expires, the local
+/// socket often stays "established": heartbeats keep landing in the kernel
+/// send buffer, so neither writes nor TCP keepalive report a failure for
+/// many minutes. Once the node has shown it answers heartbeats, a long
+/// silence is treated as a dead link so the remote is replaced.
+#[derive(Debug)]
+struct L3Liveness {
+    last_frame_at: Instant,
+    heartbeat_acknowledged: bool,
+}
+
+impl L3Liveness {
+    fn new(now: Instant) -> Self {
+        Self {
+            last_frame_at: now,
+            heartbeat_acknowledged: false,
+        }
+    }
+
+    fn record_frame(&mut self, cmd: u8, now: Instant) {
+        self.last_frame_at = now;
+        if cmd == L3_HEARTBEAT_REPLY_CMD {
+            self.heartbeat_acknowledged = true;
+        }
+    }
+
+    fn is_stale(&self, now: Instant) -> bool {
+        // Nodes that never answer heartbeats cannot be judged by silence.
+        self.heartbeat_acknowledged
+            && now.saturating_duration_since(self.last_frame_at) >= L3_LIVENESS_TIMEOUT
     }
 }
 
@@ -2284,6 +2342,7 @@ fn drain_l3_remote_frames(
     incoming_tx: &mpsc::Sender<Vec<u8>>,
     conntracks: &Arc<ConntrackMgr>,
     vip_list: &Arc<Mutex<Vec<Ipv4Addr>>>,
+    liveness: &mut L3Liveness,
     frame_limit: usize,
 ) -> AtrResult<bool> {
     stream
@@ -2294,6 +2353,7 @@ fn drain_l3_remote_frames(
             let Some(frame) = read_l3_frame_available(stream)? else {
                 return Ok(false);
             };
+            liveness.record_frame(frame.cmd, Instant::now());
             handle_l3_remote_frame(frame, incoming_tx, conntracks, vip_list)?;
         }
         Ok(true)
@@ -2334,7 +2394,7 @@ fn handle_l3_remote_frame(
                 ));
             }
         }
-        0x95 => {}
+        L3_HEARTBEAT_REPLY_CMD => {}
         0x96 => {
             if let Some(ips) = parse_virtual_ip_bytes(&frame.payload) {
                 *vip_list.lock().unwrap() = ips;
@@ -3255,11 +3315,12 @@ impl fmt::Display for PacketMeta {
 #[cfg(test)]
 mod tests {
     use super::{
-        AtrClient, DataMode, L3RemoteCommand, TcpFrameRead, TcpTunnel, TcpTunnelCommand,
-        cached_default_interface_index, compute_default_interface_index, configure_connected_tcp,
-        decode_l3_data_payload, drain_l3_remote_commands, read_tcp_frame,
-        refresh_default_interface_index, store_default_interface_index, tcp_stream_pair,
-        tls_server_name_for, wait_for_tcp_connect_status, write_tcp_payload,
+        AtrClient, DataMode, L3_HEARTBEAT_REPLY_CMD, L3_LIVENESS_TIMEOUT, L3Liveness,
+        L3RemoteCommand, TcpFrameRead, TcpTunnel, TcpTunnelCommand, cached_default_interface_index,
+        compute_default_interface_index, configure_connected_tcp, decode_l3_data_payload,
+        drain_l3_remote_commands, read_tcp_frame, refresh_default_interface_index,
+        store_default_interface_index, tcp_stream_pair, tls_server_name_for,
+        wait_for_tcp_connect_status, write_tcp_payload,
     };
     use crate::resource::{IpResource, ResourceSnapshot};
     use crate::types::{ClientConfig, SessionMaterial};
@@ -3398,6 +3459,22 @@ mod tests {
 
         drop(tunnel);
         assert!(matches!(write_rx.recv(), Ok(TcpTunnelCommand::Close)));
+    }
+
+    #[test]
+    fn l3_liveness_only_expires_after_heartbeat_replies_were_seen() {
+        use std::time::{Duration, Instant};
+        let start = Instant::now();
+        let mut liveness = L3Liveness::new(start);
+        let later = start + L3_LIVENESS_TIMEOUT + Duration::from_secs(1);
+        assert!(!liveness.is_stale(later), "unknown heartbeat support");
+
+        liveness.record_frame(L3_HEARTBEAT_REPLY_CMD, start);
+        assert!(!liveness.is_stale(start + Duration::from_secs(30)));
+        assert!(liveness.is_stale(later));
+
+        liveness.record_frame(0x94, later);
+        assert!(!liveness.is_stale(later + Duration::from_secs(1)));
     }
 
     #[test]
