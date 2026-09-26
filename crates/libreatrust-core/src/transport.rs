@@ -300,21 +300,51 @@ struct TcpTunnelEvent {
     wake_readable: bool,
 }
 
-// Built once per tunnel worker: recreating the poll for every event would
-// cost a fresh epoll/kqueue instance plus two fd dups per readiness
-// notification. The registered streams must be kept alive for the lifetime
-// of the source: registration does not own the fds, and dropping them would
-// leave the poll watching closed descriptors.
 struct TcpTunnelEventSource {
-    poll: mio::Poll,
-    // Kept only to keep the registered descriptors open; kqueue events are
-    // read from `poll`, never from these handles.
-    _socket: mio::net::TcpStream,
-    _wake: mio::net::TcpStream,
-    events: mio::Events,
+    readiness: SocketReadiness,
 }
 
 impl TcpTunnelEventSource {
+    fn new(socket: &TcpStream, wake: &TcpStream) -> AtrResult<Self> {
+        Ok(Self {
+            readiness: SocketReadiness::new(socket, wake)?,
+        })
+    }
+
+    fn wait(&mut self) -> AtrResult<TcpTunnelEvent> {
+        self.readiness.wait(None)
+    }
+}
+
+/// Waits until a tunnel socket or its wake socket has data to read.
+///
+/// The workers read through the std/rustls stream, not through the poller.
+/// That is fine for epoll/kqueue, but mio's Windows backend only re-arms a
+/// source after an I/O call *through that mio source* returns `WouldBlock`:
+/// every source would report readiness exactly once and a tunnel would stall
+/// after its first chunk of downstream data. Windows therefore uses the
+/// level-triggered `WSAPoll` (available since Vista).
+///
+/// Built once per worker: recreating the poll for every event would cost a
+/// fresh epoll/kqueue instance plus two fd dups per readiness notification.
+/// The registered streams are kept alive for the lifetime of the poller.
+struct SocketReadiness {
+    #[cfg(not(windows))]
+    poll: mio::Poll,
+    #[cfg(not(windows))]
+    events: mio::Events,
+    #[cfg(not(windows))]
+    _socket: mio::net::TcpStream,
+    #[cfg(not(windows))]
+    _wake: mio::net::TcpStream,
+    #[cfg(windows)]
+    socket: TcpStream,
+    #[cfg(windows)]
+    wake: TcpStream,
+}
+
+impl SocketReadiness {
+    #[cfg(not(windows))]
     fn new(socket: &TcpStream, wake: &TcpStream) -> AtrResult<Self> {
         use mio::net::TcpStream as MioTcpStream;
         use mio::{Interest, Poll, Token};
@@ -328,19 +358,20 @@ impl TcpTunnelEventSource {
             .register(&mut wake, Token(1), Interest::READABLE)?;
         Ok(Self {
             poll,
+            events: mio::Events::with_capacity(8),
             _socket: socket,
             _wake: wake,
-            events: mio::Events::with_capacity(2),
         })
     }
 
-    fn wait(&mut self) -> AtrResult<TcpTunnelEvent> {
+    #[cfg(not(windows))]
+    fn wait(&mut self, timeout: Option<Duration>) -> AtrResult<TcpTunnelEvent> {
         use mio::Token;
         use mio::event::Event;
 
         self.events.clear();
         self.poll
-            .poll(&mut self.events, None)
+            .poll(&mut self.events, timeout)
             .map_err(AtrError::from)?;
         Ok(TcpTunnelEvent {
             socket_readable: self
@@ -351,6 +382,56 @@ impl TcpTunnelEventSource {
                 .events
                 .iter()
                 .any(|event: &Event| event.token() == Token(1)),
+        })
+    }
+
+    #[cfg(windows)]
+    fn new(socket: &TcpStream, wake: &TcpStream) -> AtrResult<Self> {
+        Ok(Self {
+            socket: socket.try_clone()?,
+            wake: wake.try_clone()?,
+        })
+    }
+
+    #[cfg(windows)]
+    fn wait(&mut self, timeout: Option<Duration>) -> AtrResult<TcpTunnelEvent> {
+        use std::os::windows::io::AsRawSocket;
+        use windows_sys::Win32::Networking::WinSock::{
+            POLLERR, POLLHUP, POLLNVAL, POLLRDNORM, SOCKET_ERROR, WSAGetLastError, WSAPOLLFD,
+            WSAPoll,
+        };
+
+        let mut fds = [
+            WSAPOLLFD {
+                fd: self.socket.as_raw_socket() as usize,
+                events: POLLRDNORM,
+                revents: 0,
+            },
+            WSAPOLLFD {
+                fd: self.wake.as_raw_socket() as usize,
+                events: POLLRDNORM,
+                revents: 0,
+            },
+        ];
+        // Round up so a sub-millisecond deadline does not become a busy loop.
+        let timeout_ms = match timeout {
+            None => -1,
+            Some(duration) => {
+                let millis = duration.as_micros().div_ceil(1000);
+                i32::try_from(millis).unwrap_or(i32::MAX)
+            }
+        };
+        let result = unsafe { WSAPoll(fds.as_mut_ptr(), fds.len() as u32, timeout_ms) };
+        if result == SOCKET_ERROR {
+            let code = unsafe { WSAGetLastError() };
+            return Err(AtrError::from(std::io::Error::from_raw_os_error(code)));
+        }
+        // Hang-ups and errors count as readable: the following read reports
+        // them to the worker.
+        let ready = |fd: &WSAPOLLFD| fd.revents & (POLLRDNORM | POLLHUP | POLLERR | POLLNVAL) != 0;
+        Ok(TcpTunnelEvent {
+            socket_readable: ready(&fds[0]),
+            wake_readable: ready(&fds[1]),
         })
     }
 }
@@ -782,8 +863,62 @@ fn interface_index_by_name(name: &str) -> AtrResult<Option<u32>> {
         .map(Some)
 }
 
+/// Picks the interface Windows itself would use for the default route: the
+/// operational interface whose default route has the lowest effective metric
+/// (route metric + interface metric). Virtual switches (Hyper-V, VMware) are
+/// usually "up" Ethernet adapters without a default route, so taking the first
+/// Ethernet/Wi-Fi adapter can bind the control connection to a dead link.
 #[cfg(target_os = "windows")]
-fn compute_default_interface_index(_addr: &SocketAddr) -> Option<u32> {
+fn windows_default_route_interface(addr: &SocketAddr) -> Option<u32> {
+    use windows_sys::Win32::Foundation::NO_ERROR;
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        FreeMibTable, GetIpForwardTable2, GetIpInterfaceEntry, InitializeIpInterfaceEntry,
+        MIB_IPFORWARD_TABLE2, MIB_IPINTERFACE_ROW,
+    };
+    use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6};
+
+    let family = if addr.is_ipv4() { AF_INET } else { AF_INET6 };
+    let up: Vec<u32> = windows_adapters()
+        .ok()?
+        .into_iter()
+        .map(|(_, index, _)| index)
+        .collect();
+    let mut table: *mut MIB_IPFORWARD_TABLE2 = std::ptr::null_mut();
+    if unsafe { GetIpForwardTable2(family, &mut table) } != NO_ERROR || table.is_null() {
+        return None;
+    }
+    let mut best: Option<(u32, u32)> = None;
+    unsafe {
+        let count = (*table).NumEntries as usize;
+        let rows = std::slice::from_raw_parts((*table).Table.as_ptr(), count);
+        for row in rows {
+            if row.DestinationPrefix.PrefixLength != 0 || !up.contains(&row.InterfaceIndex) {
+                continue;
+            }
+            let mut interface: MIB_IPINTERFACE_ROW = std::mem::zeroed();
+            InitializeIpInterfaceEntry(&mut interface);
+            interface.Family = family;
+            interface.InterfaceIndex = row.InterfaceIndex;
+            let interface_metric = if GetIpInterfaceEntry(&mut interface) == NO_ERROR {
+                interface.Metric
+            } else {
+                0
+            };
+            let metric = row.Metric.saturating_add(interface_metric);
+            if best.is_none_or(|(_, current)| metric < current) {
+                best = Some((row.InterfaceIndex, metric));
+            }
+        }
+        FreeMibTable(table as *const _);
+    }
+    best.map(|(index, _)| index)
+}
+
+#[cfg(target_os = "windows")]
+fn compute_default_interface_index(addr: &SocketAddr) -> Option<u32> {
+    if let Some(index) = windows_default_route_interface(addr) {
+        return Some(index);
+    }
     let adapters = windows_adapters().ok()?;
     adapters
         .iter()
@@ -2212,18 +2347,7 @@ fn run_l3_remote_worker_inner(
     conntracks: &Arc<ConntrackMgr>,
     vip_list: &Arc<Mutex<Vec<Ipv4Addr>>>,
 ) -> AtrResult<()> {
-    use mio::event::Event;
-    use mio::net::TcpStream as MioTcpStream;
-    use mio::{Events, Interest, Poll, Token};
-
-    let mut socket_poll = MioTcpStream::from_std(stream.socket().try_clone()?);
-    let mut wake_poll = MioTcpStream::from_std(wake_rx.try_clone()?);
-    let mut poll = Poll::new().map_err(AtrError::from)?;
-    poll.registry()
-        .register(&mut socket_poll, Token(0), Interest::READABLE)?;
-    poll.registry()
-        .register(&mut wake_poll, Token(1), Interest::READABLE)?;
-    let mut events = Events::with_capacity(8);
+    let mut readiness = SocketReadiness::new(stream.socket(), wake_rx)?;
     let mut next_heartbeat = Instant::now() + L3_PROTOCOL_HEARTBEAT_INTERVAL;
     let mut liveness = L3Liveness::new(Instant::now());
     let mut continue_reading = false;
@@ -2260,12 +2384,10 @@ fn run_l3_remote_worker_inner(
         }
 
         let timeout = next_heartbeat.saturating_duration_since(Instant::now());
-        events.clear();
-        poll.poll(&mut events, Some(timeout))
-            .map_err(AtrError::from)?;
-
-        let wake_readable = events.iter().any(|event: &Event| event.token() == Token(1));
-        let socket_readable = events.iter().any(|event: &Event| event.token() == Token(0));
+        let TcpTunnelEvent {
+            socket_readable,
+            wake_readable,
+        } = readiness.wait(Some(timeout))?;
 
         if wake_readable {
             drain_wake_stream(wake_rx);
