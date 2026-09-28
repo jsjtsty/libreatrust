@@ -206,6 +206,14 @@ fn run_tcp_tunnel_worker(
         }
     };
 
+    // Reading the connect status may have pulled the first data frames into
+    // rustls as well (servers that speak first, e.g. SSH banners, send them
+    // right behind the status). The socket will not become readable again
+    // for data that is already buffered, so deliver it before waiting.
+    if !drain_tcp_tunnel_frames(&mut stream, &incoming_tx) {
+        return;
+    }
+
     loop {
         if !drain_tcp_tunnel_commands(&mut stream, &write_rx) {
             return;
@@ -2387,7 +2395,9 @@ fn run_l3_remote_worker_inner(
     let mut readiness = SocketReadiness::new(stream.socket(), wake_rx)?;
     let mut next_heartbeat = Instant::now() + L3_PROTOCOL_HEARTBEAT_INTERVAL;
     let mut liveness = L3Liveness::new(Instant::now());
-    let mut continue_reading = false;
+    // Frames that arrived with the handshake may already sit in rustls'
+    // buffer, where socket readiness cannot report them: read first.
+    let mut continue_reading = true;
 
     loop {
         if !drain_l3_remote_commands(stream, command_rx)? {
