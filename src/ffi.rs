@@ -285,6 +285,8 @@ pub struct atr_proxy_service_config_t {
     pub idle_timeout_ms: u64,
     pub enable_http: bool,
     pub enable_socks5: bool,
+    /// Optional; NULL or empty disables the PAC endpoint.
+    pub pac_token: *const c_char,
 }
 
 #[repr(C)]
@@ -932,6 +934,11 @@ fn proxy_service_config_from_ffi(
     config.idle_timeout_ms = input.idle_timeout_ms;
     config.enable_http = input.enable_http;
     config.enable_socks5 = input.enable_socks5;
+    config.pac_token = if input.pac_token.is_null() {
+        None
+    } else {
+        Some(cstr_to_string(input.pac_token, "pac_token")?).filter(|token| !token.is_empty())
+    };
     Ok(config)
 }
 

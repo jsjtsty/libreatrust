@@ -1,6 +1,6 @@
 use crate::client::AtrClient;
 use crate::error::{AtrError, AtrResult};
-use crate::transport::{L3Tunnel, TcpTunnel, connect_tcp_bound};
+use crate::transport::{L3Tunnel, TcpTunnel, connect_tcp_any};
 use crate::types::RouteDecision;
 use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
@@ -35,6 +35,10 @@ pub struct ProxyServiceConfig {
     pub idle_timeout_ms: u64,
     pub enable_http: bool,
     pub enable_socks5: bool,
+    /// When set, the HTTP proxy serves a PAC file at
+    /// `/proxy.pac?token=<pac_token>`. The token keeps web pages, which can
+    /// reach loopback too, from loading the list of managed resources.
+    pub pac_token: Option<String>,
 }
 
 impl Default for ProxyServiceConfig {
@@ -46,6 +50,7 @@ impl Default for ProxyServiceConfig {
             idle_timeout_ms: 0,
             enable_http: true,
             enable_socks5: true,
+            pac_token: None,
         }
     }
 }
@@ -67,7 +72,7 @@ pub struct ProxyService {
 }
 
 impl ProxyService {
-    pub fn start(client: AtrClient, config: ProxyServiceConfig) -> AtrResult<Self> {
+    pub fn start(client: AtrClient, mut config: ProxyServiceConfig) -> AtrResult<Self> {
         if !config.enable_http && !config.enable_socks5 {
             return Err(AtrError::InvalidArgument(
                 "at least one proxy protocol must be enabled".into(),
@@ -77,6 +82,10 @@ impl ProxyService {
         let bind_addr = format!("{}:{}", config.listen_host, config.listen_port);
         let listener = TcpListener::bind(&bind_addr)?;
         let endpoint = listener.local_addr()?;
+        // Connections need the real endpoint (e.g. for the PAC file) even
+        // when an ephemeral port was requested.
+        config.listen_host = endpoint.ip().to_string();
+        config.listen_port = endpoint.port();
         let stop = Arc::new(AtomicBool::new(false));
         let active_connections = Arc::new(AtomicU64::new(0));
         let total_connections = Arc::new(AtomicU64::new(0));
@@ -464,13 +473,24 @@ fn handle_http(
                 Err(err)
             }
         }
+    } else if request.target.starts_with('/') {
+        serve_local_http_request(client_stream, &request, &client, &config)
     } else {
         let (host, port, rewritten) = rewrite_http_proxy_request(request)?;
         crate::diag_log(format!(
             "[libreatrust][proxy] http request target={host}:{port} rewritten={}B",
             rewritten.len()
         ));
-        let remote = open_proxy_target(&client, &host, port, &config)?;
+        let remote = match open_proxy_target(&client, &host, port, &config) {
+            Ok(remote) => remote,
+            Err(err) => {
+                let _ = client_stream.write_all(
+                    b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+                );
+                let _ = client_stream.flush();
+                return Err(err);
+            }
+        };
         remote.write_all(&rewritten)?;
         if matches!(remote, ProxyRemote::Managed(_)) {
             managed_upload_bytes.fetch_add(rewritten.len() as u64, Ordering::Relaxed);
@@ -483,6 +503,59 @@ fn handle_http(
             managed_download_bytes,
         )
     }
+}
+
+/// Answers requests addressed to the proxy itself (origin-form targets).
+/// Only the PAC file is served; anything else is rejected.
+fn serve_local_http_request(
+    mut client_stream: TcpStream,
+    request: &HttpProxyRequest,
+    client: &AtrClient,
+    config: &ProxyServiceConfig,
+) -> AtrResult<()> {
+    let is_get = request.method.eq_ignore_ascii_case("GET");
+    let is_head = request.method.eq_ignore_ascii_case("HEAD");
+    let (path, query) = request
+        .target
+        .split_once('?')
+        .unwrap_or((request.target.as_str(), ""));
+    let token_matches = config.pac_token.as_deref().is_some_and(|token| {
+        !token.is_empty()
+            && query
+                .split('&')
+                .any(|pair| pair.strip_prefix("token=") == Some(token))
+    });
+
+    let response = if (is_get || is_head) && path == "/proxy.pac" && token_matches {
+        let endpoint = SocketAddr::new(
+            config
+                .listen_host
+                .parse()
+                .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+            config.listen_port,
+        );
+        let body = client
+            .resource()
+            .map(|resource| crate::pac::generate_pac(resource, endpoint))
+            .unwrap_or_else(|| {
+                "function FindProxyForURL(url, host) { return \"DIRECT\"; }\n".into()
+            });
+        let mut response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/x-ns-proxy-autoconfig\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        if is_get {
+            response.extend_from_slice(body.as_bytes());
+        }
+        response
+    } else {
+        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+    };
+    client_stream.write_all(&response)?;
+    client_stream.flush()?;
+    let _ = client_stream.shutdown(Shutdown::Both);
+    Ok(())
 }
 
 fn open_proxy_target(
@@ -503,14 +576,13 @@ fn open_proxy_target(
             ))
         }
         ProxyRouteDecision::Direct => {
-            let addr = (host, port).to_socket_addrs()?.next().ok_or_else(|| {
-                AtrError::NetworkFailed(format!("failed to resolve {host}:{port}"))
-            })?;
+            let addrs: Vec<SocketAddr> = (host, port).to_socket_addrs()?.collect();
             crate::diag_log(format!(
-                "[libreatrust][proxy] route direct requested={host}:{port} connect={addr}"
+                "[libreatrust][proxy] route direct requested={host}:{port} candidates={}",
+                addrs.len()
             ));
-            let stream = connect_tcp_bound(
-                &addr,
+            let stream = connect_tcp_any(
+                &addrs,
                 Duration::from_millis(config.connect_timeout_ms.max(1)),
                 client.client_config(),
             )?;
@@ -987,14 +1059,47 @@ fn rewrite_http_proxy_request(request: HttpProxyRequest) -> AtrResult<(String, u
         "/"
     };
     let (host, port) = parse_host_port(authority, default_port)?;
+    // After the first request the connection is relayed byte for byte, so a
+    // client that reuses its proxy connection for another origin would send
+    // that request to this origin. Ask both sides to close after one
+    // exchange, except for protocol upgrades (e.g. WebSocket) which become a
+    // raw tunnel anyway.
+    let connection_tokens: Vec<String> = request
+        .headers
+        .iter()
+        .filter(|(name, _)| {
+            name.eq_ignore_ascii_case("connection") || name.eq_ignore_ascii_case("proxy-connection")
+        })
+        .flat_map(|(_, value)| value.split(','))
+        .map(|token| token.trim().to_ascii_lowercase())
+        .filter(|token| !token.is_empty())
+        .collect();
+    let is_upgrade = connection_tokens.iter().any(|token| token == "upgrade")
+        && request
+            .headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("upgrade"));
     let mut output = Vec::new();
     output.extend_from_slice(
         format!("{} {} {}\r\n", request.method, path, request.version).as_bytes(),
     );
     for (name, value) in request.headers {
+        let lower = name.to_ascii_lowercase();
+        let hop_by_hop = matches!(
+            lower.as_str(),
+            "connection" | "proxy-connection" | "keep-alive" | "proxy-authorization"
+        ) || (connection_tokens.contains(&lower)
+            && !(is_upgrade && lower == "upgrade"));
+        if hop_by_hop {
+            continue;
+        }
         output.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
     }
-    output.extend_from_slice(b"\r\n");
+    output.extend_from_slice(if is_upgrade {
+        b"Connection: Upgrade\r\n\r\n".as_slice()
+    } else {
+        b"Connection: close\r\n\r\n".as_slice()
+    });
     output.extend_from_slice(&request.body);
     Ok((host, port, output))
 }
@@ -1216,8 +1321,61 @@ mod tests {
         assert_eq!(port, 8080);
         assert_eq!(
             rewritten,
-            b"GET /p?q=1 HTTP/1.1\r\nHost: example.com:8080\r\n\r\n"
+            b"GET /p?q=1 HTTP/1.1\r\nHost: example.com:8080\r\nConnection: close\r\n\r\n"
         );
+    }
+
+    #[test]
+    fn http_rewrite_drops_hop_by_hop_headers() {
+        let request = parse_http_proxy_request(
+            b"GET http://a.example/ HTTP/1.1\r\nHost: a.example\r\nProxy-Connection: keep-alive\r\nConnection: keep-alive, X-Hop\r\nX-Hop: 1\r\nKeep-Alive: timeout=5\r\nProxy-Authorization: Basic x\r\nAccept: */*\r\n\r\n",
+        )
+        .unwrap();
+        let (_, _, rewritten) = rewrite_http_proxy_request(request).unwrap();
+        assert_eq!(
+            String::from_utf8(rewritten).unwrap(),
+            "GET / HTTP/1.1\r\nHost: a.example\r\nAccept: */*\r\nConnection: close\r\n\r\n"
+        );
+    }
+
+    #[test]
+    fn http_rewrite_keeps_websocket_upgrade() {
+        let request = parse_http_proxy_request(
+            b"GET http://a.example/ws HTTP/1.1\r\nHost: a.example\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+        )
+        .unwrap();
+        let (_, _, rewritten) = rewrite_http_proxy_request(request).unwrap();
+        assert_eq!(
+            String::from_utf8(rewritten).unwrap(),
+            "GET /ws HTTP/1.1\r\nHost: a.example\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
+        );
+    }
+
+    #[test]
+    fn proxy_serves_pac_only_with_the_token() {
+        let service = start_test_proxy(ProxyServiceConfig {
+            listen_host: "127.0.0.1".into(),
+            listen_port: 0,
+            pac_token: Some("secret".into()),
+            ..Default::default()
+        });
+        let fetch = |target: &str| {
+            let mut client = TcpStream::connect(service.endpoint()).unwrap();
+            client
+                .write_all(format!("GET {target} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").as_bytes())
+                .unwrap();
+            let mut response = String::new();
+            client.read_to_string(&mut response).unwrap();
+            response
+        };
+
+        let ok = fetch("/proxy.pac?token=secret");
+        assert!(ok.starts_with("HTTP/1.1 200 OK"), "{ok}");
+        assert!(ok.contains("function FindProxyForURL"));
+        assert!(fetch("/proxy.pac").starts_with("HTTP/1.1 404"));
+        assert!(fetch("/proxy.pac?token=wrong").starts_with("HTTP/1.1 404"));
+        assert!(fetch("/other?token=secret").starts_with("HTTP/1.1 404"));
+        service.stop().unwrap();
     }
 
     #[test]

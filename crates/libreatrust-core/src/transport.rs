@@ -478,6 +478,43 @@ fn set_no_sigpipe(fd: i32) {
     let _ = fd;
 }
 
+/// Longest time spent on one address while other candidates remain, so a
+/// black-holed address (typically unusable IPv6) does not consume the whole
+/// connect timeout.
+const CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(2500);
+
+/// Connects to the first reachable address, trying each candidate in the
+/// resolver's order.
+pub(crate) fn connect_tcp_any(
+    addrs: &[SocketAddr],
+    timeout: Duration,
+    config: &crate::types::ClientConfig,
+) -> AtrResult<TcpStream> {
+    let deadline = Instant::now() + timeout;
+    let mut last_error = None;
+    for (index, addr) in addrs.iter().enumerate() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let attempt_timeout = if index + 1 == addrs.len() {
+            remaining
+        } else {
+            remaining.min(CONNECT_ATTEMPT_TIMEOUT)
+        };
+        match connect_tcp_bound(addr, attempt_timeout, config) {
+            Ok(stream) => return Ok(stream),
+            Err(err) => {
+                crate::diag_log(format!(
+                    "[libreatrust][transport] connect candidate {addr} failed: {err}"
+                ));
+                last_error = Some(err);
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| AtrError::NetworkFailed("no address to connect to".into())))
+}
+
 pub(crate) fn connect_tcp_bound(
     addr: &SocketAddr,
     timeout: Duration,
@@ -2545,12 +2582,12 @@ fn connect_tls(
     addr: &str,
     cfg: &crate::types::ClientConfig,
 ) -> AtrResult<StreamOwned<ClientConnection, TcpStream>> {
-    let socket_addr = addr
-        .to_socket_addrs()?
-        .next()
-        .ok_or_else(|| AtrError::NetworkFailed(format!("failed to resolve {addr}")))?;
-    let tcp = connect_tcp_bound(
-        &socket_addr,
+    let socket_addrs: Vec<SocketAddr> = addr.to_socket_addrs()?.collect();
+    if socket_addrs.is_empty() {
+        return Err(AtrError::NetworkFailed(format!("failed to resolve {addr}")));
+    }
+    let tcp = connect_tcp_any(
+        &socket_addrs,
         Duration::from_millis(cfg.connect_timeout_ms.max(1)),
         cfg,
     )?;

@@ -218,6 +218,8 @@ typedef struct atr_proxy_service_config_t {
     uint64_t idle_timeout_ms;
     bool enable_http;
     bool enable_socks5;
+    /* Optional; NULL or empty disables the PAC file at /proxy.pac?token=... */
+    const char *pac_token;
 } atr_proxy_service_config_t;
 
 typedef struct atr_proxy_service_endpoint_t {

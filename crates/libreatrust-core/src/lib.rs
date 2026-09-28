@@ -1,6 +1,7 @@
 mod auth;
 mod client;
 mod error;
+mod pac;
 mod proxy_service;
 mod resource;
 mod sign;
@@ -43,6 +44,7 @@ pub(crate) fn diag_log(_message: impl AsRef<str>) {}
 pub use auth::AuthSession;
 pub use client::AtrClient;
 pub use error::{AtrError, AtrResult, ErrorCode};
+pub use pac::generate_pac;
 pub use proxy_service::{
     ProxyService, ProxyServiceConfig, ProxyServiceEvent, ProxyServiceStats, ProxyServiceStatus,
 };
