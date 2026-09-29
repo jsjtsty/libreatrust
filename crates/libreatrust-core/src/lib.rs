@@ -46,7 +46,8 @@ pub use client::AtrClient;
 pub use error::{AtrError, AtrResult, ErrorCode};
 pub use pac::generate_pac;
 pub use proxy_service::{
-    ProxyService, ProxyServiceConfig, ProxyServiceEvent, ProxyServiceStats, ProxyServiceStatus,
+    ProxyService, ProxyServiceConfig, ProxyServiceEvent, ProxyServiceEventListener,
+    ProxyServiceStats, ProxyServiceStatus,
 };
 pub use resource::{DomainResource, IpResource, ResourceSnapshot, parse_resource_bytes};
 pub use transport::{L3Tunnel, TcpTunnel, UdpTunnel};

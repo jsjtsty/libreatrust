@@ -211,6 +211,10 @@ typedef enum atr_proxy_service_event_kind_t {
     ATR_PROXY_SERVICE_EVENT_SESSION_INVALIDATED = 2
 } atr_proxy_service_event_kind_t;
 
+/* Called on a library thread when the proxy service records an event.
+ * `message` is only valid for the duration of the call; copy it to keep it. */
+typedef void (*atr_proxy_service_event_callback_t)(atr_proxy_service_event_kind_t kind, const char *message, void *user_data);
+
 typedef struct atr_proxy_service_config_t {
     const char *listen_host;
     uint16_t listen_port;
@@ -297,6 +301,12 @@ int atr_proxy_service_status(const atr_proxy_service_t *service, atr_proxy_servi
 int atr_proxy_service_get_endpoint(const atr_proxy_service_t *service, atr_proxy_service_endpoint_t *out);
 int atr_proxy_service_get_stats(const atr_proxy_service_t *service, atr_proxy_service_stats_t *out);
 int atr_proxy_service_get_traffic_stats(const atr_proxy_service_t *service, atr_proxy_service_traffic_stats_t *out);
+/* Registers a callback invoked as soon as the service records an event, replacing any previous one;
+ * pass NULL to clear it. Events remain available through atr_proxy_service_take_event.
+ * The callback runs on a library thread: return quickly and do not call atr_proxy_service_stop,
+ * atr_proxy_service_free or this function from it. When this function returns, the previous
+ * callback has finished and will not be called again, so its user_data can be released. */
+int atr_proxy_service_set_event_callback(const atr_proxy_service_t *service, atr_proxy_service_event_callback_t callback, void *user_data);
 int atr_proxy_service_take_event(const atr_proxy_service_t *service, atr_proxy_service_event_kind_t *out_kind, char **out_message);
 void atr_proxy_service_endpoint_free(atr_proxy_service_endpoint_t *endpoint);
 void atr_proxy_service_stats_free(atr_proxy_service_stats_t *stats);

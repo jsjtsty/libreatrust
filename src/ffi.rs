@@ -3,12 +3,13 @@
 use libreatrust_core::{
     AtrClient, AtrError, AtrResult, AuthChallenge, AuthChallengeKind, AuthConfig, AuthSession,
     CallbackTarget, ClientConfig, CookieRecord, DomainResource, ErrorCode, IpResource, L3Tunnel,
-    PasswordLoginInput, ProxyService, ProxyServiceConfig, ProxyServiceEvent, ProxyServiceStatus,
-    ResourceSnapshot, SessionMaterial, SmsLoginInput, TcpTunnel, UdpTunnel, parse_resource_bytes,
+    PasswordLoginInput, ProxyService, ProxyServiceConfig, ProxyServiceEvent,
+    ProxyServiceEventListener, ProxyServiceStatus, ResourceSnapshot, SessionMaterial,
+    SmsLoginInput, TcpTunnel, UdpTunnel, parse_resource_bytes,
 };
 use std::ffi::{CStr, CString};
 use std::net::Ipv4Addr;
-use std::os::raw::c_char;
+use std::os::raw::{c_char, c_void};
 use std::ptr;
 
 #[repr(C)]
@@ -2078,6 +2079,68 @@ pub extern "C" fn atr_proxy_service_take_event(
     }
 }
 
+/// Called on a library thread when the proxy service records an event.
+/// `message` is only valid for the duration of the call; copy it to keep it.
+#[allow(non_camel_case_types)]
+pub type atr_proxy_service_event_callback_t = Option<
+    unsafe extern "C" fn(
+        kind: atr_proxy_service_event_kind_t,
+        message: *const c_char,
+        user_data: *mut c_void,
+    ),
+>;
+
+struct CallbackUserData(*mut c_void);
+
+// The caller guarantees `user_data` may be used from any thread.
+unsafe impl Send for CallbackUserData {}
+unsafe impl Sync for CallbackUserData {}
+
+impl CallbackUserData {
+    // A method (not `.0`) so closures capture the whole wrapper, not the raw pointer.
+    fn get(&self) -> *mut c_void {
+        self.0
+    }
+}
+
+/// Registers `callback` to be called as soon as the service records an event,
+/// replacing any previous callback; pass NULL to clear it. Events are still
+/// available through `atr_proxy_service_take_event`.
+///
+/// The callback runs on a library thread. It must return quickly and must not
+/// call `atr_proxy_service_stop`, `atr_proxy_service_free` or this function.
+/// When this function returns, any previous callback has finished and will not
+/// be called again, so its `user_data` can be released.
+#[unsafe(no_mangle)]
+pub extern "C" fn atr_proxy_service_set_event_callback(
+    service: *const atr_proxy_service_t,
+    callback: atr_proxy_service_event_callback_t,
+    user_data: *mut c_void,
+) -> i32 {
+    if service.is_null() {
+        return ErrorCode::InvalidArgument as i32;
+    }
+    let listener: Option<ProxyServiceEventListener> = callback.map(|callback| {
+        let user_data = CallbackUserData(user_data);
+        Box::new(move |event: &ProxyServiceEvent| {
+            let (kind, message) = match event {
+                ProxyServiceEvent::SessionInvalidated { message } => (
+                    atr_proxy_service_event_kind_t::ATR_PROXY_SERVICE_EVENT_SESSION_INVALIDATED,
+                    message,
+                ),
+                ProxyServiceEvent::Error { message } => (
+                    atr_proxy_service_event_kind_t::ATR_PROXY_SERVICE_EVENT_ERROR,
+                    message,
+                ),
+            };
+            let message = CString::new(message.replace('\0', " ")).unwrap_or_default();
+            unsafe { callback(kind, message.as_ptr(), user_data.get()) };
+        }) as ProxyServiceEventListener
+    });
+    unsafe { &*service }.inner.set_event_listener(listener);
+    ErrorCode::Ok as i32
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn atr_proxy_service_endpoint_free(endpoint: *mut atr_proxy_service_endpoint_t) {
     if endpoint.is_null() {
@@ -2176,6 +2239,14 @@ pub extern "C" fn atr_auth_challenge_free(challenge: *mut atr_auth_challenge_t) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_null_service_for_event_callback() {
+        assert_eq!(
+            atr_proxy_service_set_event_callback(ptr::null(), None, ptr::null_mut()),
+            ErrorCode::InvalidArgument as i32
+        );
+    }
 
     #[test]
     fn rejects_null_client_new_arguments() {

@@ -14,7 +14,7 @@ The library provides:
 - Client resource parsing and snapshot access
 - Managed-domain and managed-IP route decisions
 - TCP, UDP, and L3 tunnel primitives
-- Proxy service primitives with event and traffic statistics
+- Proxy service primitives with event (polled or callback) and traffic statistics
 - DNS and node-group resource access
 - C ABI bindings for Swift, Kotlin, C/C++, and other FFI consumers
 

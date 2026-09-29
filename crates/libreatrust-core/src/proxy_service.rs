@@ -55,6 +55,35 @@ impl Default for ProxyServiceConfig {
     }
 }
 
+/// Callback invoked on a library thread whenever the service records an event.
+pub type ProxyServiceEventListener = Box<dyn Fn(&ProxyServiceEvent) + Send + Sync>;
+
+/// Shared holder for the optional event listener.
+///
+/// The listener runs while the slot lock is held, so replacing or clearing it
+/// waits for an in-flight call and no call can start afterwards. A listener
+/// must therefore not call back into `set_event_listener`.
+#[derive(Clone, Default)]
+struct EventListenerSlot(Arc<Mutex<Option<ProxyServiceEventListener>>>);
+
+impl EventListenerSlot {
+    fn set(&self, listener: Option<ProxyServiceEventListener>) {
+        *self.0.lock().unwrap() = listener;
+    }
+
+    fn notify(&self, event: &ProxyServiceEvent) {
+        if let Some(listener) = self.0.lock().unwrap().as_ref() {
+            listener(event);
+        }
+    }
+}
+
+impl std::fmt::Debug for EventListenerSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("EventListenerSlot")
+    }
+}
+
 #[derive(Debug)]
 pub struct ProxyService {
     endpoint: SocketAddr,
@@ -65,6 +94,7 @@ pub struct ProxyService {
     managed_download_bytes: Arc<AtomicU64>,
     last_error: Arc<Mutex<Option<String>>>,
     last_event: Arc<Mutex<Option<ProxyServiceEvent>>>,
+    event_listener: EventListenerSlot,
     worker: Mutex<Option<thread::JoinHandle<()>>>,
     connections: Arc<Mutex<Vec<thread::JoinHandle<()>>>>,
     active_sockets: Arc<Mutex<HashMap<u64, TcpStream>>>,
@@ -93,6 +123,7 @@ impl ProxyService {
         let managed_download_bytes = Arc::new(AtomicU64::new(0));
         let last_error = Arc::new(Mutex::new(None));
         let last_event = Arc::new(Mutex::new(None));
+        let event_listener = EventListenerSlot::default();
         let connections = Arc::new(Mutex::new(Vec::new()));
         let active_sockets = Arc::new(Mutex::new(HashMap::new()));
         let keepalive_l3 = match client.open_l3_tunnel() {
@@ -115,6 +146,7 @@ impl ProxyService {
         let worker_download = managed_download_bytes.clone();
         let worker_error = last_error.clone();
         let worker_event = last_event.clone();
+        let worker_listener = event_listener.clone();
         let worker_connections = connections.clone();
         let worker_sockets = active_sockets.clone();
         let worker = thread::Builder::new()
@@ -131,6 +163,7 @@ impl ProxyService {
                     worker_download,
                     worker_error,
                     worker_event,
+                    worker_listener,
                     worker_connections,
                     worker_sockets,
                 )
@@ -146,6 +179,7 @@ impl ProxyService {
             managed_download_bytes,
             last_error,
             last_event,
+            event_listener,
             worker: Mutex::new(Some(worker)),
             connections,
             active_sockets,
@@ -199,6 +233,13 @@ impl ProxyService {
     pub fn take_event(&self) -> Option<ProxyServiceEvent> {
         self.last_event.lock().unwrap().take()
     }
+
+    /// Registers (or with `None`, clears) a listener that is called as soon as
+    /// an event is recorded, so callers do not need to poll `take_event`.
+    /// Events are still stored for `stats` and `take_event`.
+    pub fn set_event_listener(&self, listener: Option<ProxyServiceEventListener>) {
+        self.event_listener.set(listener);
+    }
 }
 
 impl Drop for ProxyService {
@@ -235,6 +276,7 @@ fn run_listener(
     managed_download_bytes: Arc<AtomicU64>,
     last_error: Arc<Mutex<Option<String>>>,
     last_event: Arc<Mutex<Option<ProxyServiceEvent>>>,
+    event_listener: EventListenerSlot,
     connections: Arc<Mutex<Vec<thread::JoinHandle<()>>>>,
     active_sockets: Arc<Mutex<HashMap<u64, TcpStream>>>,
 ) {
@@ -249,6 +291,7 @@ fn run_listener(
                 let active = active_connections.clone();
                 let error_slot = last_error.clone();
                 let event_slot = last_event.clone();
+                let listener_slot = event_listener.clone();
                 let socket_map = active_sockets.clone();
                 let upload = managed_upload_bytes.clone();
                 let download = managed_download_bytes.clone();
@@ -267,7 +310,7 @@ fn run_listener(
                             crate::diag_log(format!(
                                 "[libreatrust][proxy] connection failed: {err}"
                             ));
-                            record_proxy_error(&error_slot, &event_slot, err);
+                            record_proxy_error(&error_slot, &event_slot, &listener_slot, err);
                         }
                         socket_map.lock().unwrap().remove(&connection_id);
                         worker_active.fetch_sub(1, Ordering::Relaxed);
@@ -290,7 +333,12 @@ fn run_listener(
                 if stop.load(Ordering::SeqCst) {
                     break;
                 }
-                record_proxy_error(&last_error, &last_event, AtrError::from(err));
+                record_proxy_error(
+                    &last_error,
+                    &last_event,
+                    &event_listener,
+                    AtrError::from(err),
+                );
             }
         }
     }
@@ -299,6 +347,7 @@ fn run_listener(
 fn record_proxy_error(
     last_error: &Arc<Mutex<Option<String>>>,
     last_event: &Arc<Mutex<Option<ProxyServiceEvent>>>,
+    listener: &EventListenerSlot,
     err: AtrError,
 ) {
     let message = err.to_string();
@@ -308,7 +357,8 @@ fn record_proxy_error(
     } else {
         ProxyServiceEvent::Error { message }
     };
-    *last_event.lock().unwrap() = Some(event);
+    *last_event.lock().unwrap() = Some(event.clone());
+    listener.notify(&event);
 }
 
 fn is_session_invalidated_error(message: &str) -> bool {
@@ -1136,6 +1186,57 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::Ipv6Addr;
     use std::sync::mpsc;
+
+    #[test]
+    fn event_listener_receives_events_until_cleared() {
+        let (tx, rx) = mpsc::channel();
+        let slot = EventListenerSlot::default();
+        let last_error = Arc::new(Mutex::new(None));
+        let last_event = Arc::new(Mutex::new(None));
+
+        // No listener: event is only stored.
+        record_proxy_error(
+            &last_error,
+            &last_event,
+            &slot,
+            AtrError::Internal("boom".into()),
+        );
+        assert!(rx.try_recv().is_err());
+        assert!(last_event.lock().unwrap().is_some());
+
+        slot.set(Some(Box::new(move |event| {
+            tx.send(event.clone()).unwrap();
+        })));
+        record_proxy_error(
+            &last_error,
+            &last_event,
+            &slot,
+            AtrError::Internal("invalid SID".into()),
+        );
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            ProxyServiceEvent::SessionInvalidated { .. }
+        ));
+        record_proxy_error(
+            &last_error,
+            &last_event,
+            &slot,
+            AtrError::Internal("boom".into()),
+        );
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            ProxyServiceEvent::Error { .. }
+        ));
+
+        slot.set(None);
+        record_proxy_error(
+            &last_error,
+            &last_event,
+            &slot,
+            AtrError::Internal("boom".into()),
+        );
+        assert!(rx.try_recv().is_err());
+    }
 
     fn connected_pair() -> (TcpStream, TcpStream) {
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
