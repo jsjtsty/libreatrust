@@ -4,7 +4,7 @@ pub use libreatrust_core::{
     L3Tunnel, PasswordLoginInput, ProtocolKind, ProxyService, ProxyServiceConfig,
     ProxyServiceEvent, ProxyServiceStats, ProxyServiceStatus, ResourceSnapshot, RouteDecision,
     RouteHit, SessionMaterial, SmsLoginInput, TcpTunnel, UdpTunnel, log_file_path, log_write,
-    parse_resource_bytes, set_verbose_logging, verbose_logging_enabled,
+    parse_resource_bytes, set_log_directory, set_verbose_logging, verbose_logging_enabled,
 };
 
 mod ffi;

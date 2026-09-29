@@ -33,14 +33,31 @@ pub fn verbose_logging_enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
 }
 
+static DIRECTORY_OVERRIDE: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+/// Makes this process write `NulConnect.log` into `directory` instead of the
+/// default location. Used by the privileged helper, whose default profile
+/// directory is not readable by the user.
+pub fn set_log_directory(directory: PathBuf) {
+    *DIRECTORY_OVERRIDE.lock().unwrap_or_else(|p| p.into_inner()) = Some(directory);
+    *lock_sink() = None;
+}
+
 /// Location of the log file this process writes to.
 pub fn log_file_path() -> PathBuf {
+    if let Some(directory) = DIRECTORY_OVERRIDE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+    {
+        return directory.join("NulConnect.log");
+    }
     #[cfg(windows)]
     {
-        let base = std::env::var_os("ProgramData")
+        let base = std::env::var_os("LOCALAPPDATA")
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
-        base.join("NulConnect").join("NulConnect.log")
+            .unwrap_or_else(std::env::temp_dir);
+        base.join("NulConnect").join("Logs").join("NulConnect.log")
     }
     #[cfg(not(windows))]
     {

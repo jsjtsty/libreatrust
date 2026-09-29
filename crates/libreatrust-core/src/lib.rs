@@ -13,7 +13,8 @@ pub use auth::AuthSession;
 pub use client::AtrClient;
 pub use error::{AtrError, AtrResult, ErrorCode};
 pub use log::{
-    MAX_LOG_BYTES, log_file_path, log_write, set_verbose_logging, verbose_logging_enabled,
+    MAX_LOG_BYTES, log_file_path, log_write, set_log_directory, set_verbose_logging,
+    verbose_logging_enabled,
 };
 pub use pac::generate_pac;
 pub use proxy_service::{
