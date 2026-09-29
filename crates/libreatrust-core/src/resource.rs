@@ -4,7 +4,7 @@ use ipnet::Ipv4Net;
 use serde::Deserialize;
 use std::cmp::Ordering;
 use std::collections::HashMap;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IpResource {
@@ -241,6 +241,11 @@ pub(crate) fn route(
         return RouteDecision::Direct;
     }
 
+    // The tunnel only carries IPv4; IPv6 destinations always go direct.
+    if is_ipv6_literal(host) {
+        return RouteDecision::Direct;
+    }
+
     if let Ok(ip) = host.parse::<Ipv4Addr>() {
         if let Some(hit) = match_ip(snapshot, ip, port, protocol) {
             return RouteDecision::Managed(hit);
@@ -389,6 +394,12 @@ fn parse_host_entry(
     app_id: &str,
     node_group_id: &str,
 ) -> AtrResult<Option<HostEntry>> {
+    // IPv6 resources cannot be tunnelled; ignore them instead of misreading
+    // them as domain names.
+    if is_ipv6_spec(host) {
+        return Ok(None);
+    }
+
     if let Ok(ip) = host.parse::<Ipv4Addr>() {
         return Ok(Some(HostEntry::Ip(IpResource {
             ip_min: ip,
@@ -445,16 +456,40 @@ fn parse_host_entry(
 }
 
 fn parse_ip_range(host: &str) -> AtrResult<Option<(Ipv4Addr, Ipv4Addr)>> {
-    if let Some((start, end)) = host.split_once('-') {
-        let start = start
-            .parse::<Ipv4Addr>()
-            .map_err(|_| AtrError::ParseFailed(format!("invalid ip range: {host}")))?;
-        let end = end
-            .parse::<Ipv4Addr>()
-            .map_err(|_| AtrError::ParseFailed(format!("invalid ip range: {host}")))?;
+    // Hyphenated domain names (and anything else that is not an IPv4 range)
+    // fall through to the domain handling instead of failing the whole parse.
+    if let Some((start, end)) = host.split_once('-')
+        && let (Ok(start), Ok(end)) = (
+            start.trim().parse::<Ipv4Addr>(),
+            end.trim().parse::<Ipv4Addr>(),
+        )
+    {
         return Ok(Some((start, end)));
     }
     Ok(None)
+}
+
+/// True for an IPv6 literal, with or without brackets.
+fn is_ipv6_literal(host: &str) -> bool {
+    host.trim()
+        .trim_matches(['[', ']'])
+        .parse::<Ipv6Addr>()
+        .is_ok()
+}
+
+/// True for an IPv6 address, CIDR block, or address range.
+fn is_ipv6_spec(host: &str) -> bool {
+    let host = host.trim();
+    if is_ipv6_literal(host) {
+        return true;
+    }
+    if let Some((addr, _)) = host.split_once('/') {
+        return matches!(addr.trim().parse::<IpAddr>(), Ok(IpAddr::V6(_)));
+    }
+    if let Some((start, end)) = host.split_once('-') {
+        return is_ipv6_literal(start) || is_ipv6_literal(end);
+    }
+    false
 }
 
 fn is_domain_like(host: &str) -> bool {
@@ -475,6 +510,45 @@ fn ip_order(ip: Ipv4Addr) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ipv6_entries_are_skipped_not_treated_as_domains() {
+        for host in [
+            "2001:db8::1",
+            "fd00::/8",
+            "2001:db8::1-2001:db8::ff",
+            "[2001:db8::1]",
+        ] {
+            let entry = parse_host_entry(host, "tcp", 0, 65535, "app", "group").unwrap();
+            assert!(entry.is_none(), "{host} should be skipped");
+        }
+    }
+
+    #[test]
+    fn hyphenated_domain_is_a_domain_not_an_error() {
+        let entry =
+            parse_host_entry("my-host.example.com", "tcp", 0, 65535, "app", "group").unwrap();
+        assert!(matches!(entry, Some(HostEntry::Domain(..))));
+    }
+
+    #[test]
+    fn ipv6_destinations_route_direct() {
+        let mut snapshot = ResourceSnapshot::default();
+        snapshot.domain_resources.insert(
+            "example.com".into(),
+            DomainResource {
+                port_min: 0,
+                port_max: 65535,
+                protocol: "tcp".into(),
+                app_id: "app".into(),
+                node_group_id: "group".into(),
+            },
+        );
+        for host in ["2001:db8::1", "[2001:db8::1]", "::1"] {
+            let hit = route(&snapshot, host, 443, ProtocolKind::Tcp);
+            assert!(matches!(hit, RouteDecision::Direct), "{host}");
+        }
+    }
 
     #[test]
     fn routes_ipv4_range() {

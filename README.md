@@ -3,7 +3,11 @@
 [![CI](https://github.com/jsjtsty/libreatrust/actions/workflows/ci.yml/badge.svg)](https://github.com/jsjtsty/libreatrust/actions/workflows/ci.yml)
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPLv3-blue.svg)](LICENSE.txt)
 
-`libreatrust` is a Rust library and C-compatible ABI layer for secure access clients. It contains the protocol, authentication, resource, routing, and transport logic that can be shared by native desktop applications and other language runtimes.
+`libreatrust` is a third-party, open-source client library for **Sangfor aTrust** (深信服 aTrust) zero-trust / SDP access services. It is written in Rust and exposes a C-compatible ABI, so the aTrust protocol, authentication, resource, routing, and transport logic can be shared by native desktop applications and other language runtimes.
+
+> **Disclaimer:** This is an unofficial project. It is not affiliated with, endorsed by, or supported by Sangfor Technologies. "aTrust" and "Sangfor" are trademarks of their respective owners. Use it only with services you are authorized to access.
+
+[简体中文](README.zh-CN.md)
 
 ## Scope
 
@@ -19,6 +23,10 @@ The library provides:
 - C ABI bindings for Swift, Kotlin, C/C++, and other FFI consumers
 
 The library does not provide a login UI, WebView hosting, or platform-specific user-interface orchestration. Those responsibilities belong to the integrating application.
+
+## Known limitations
+
+- **IPv4 only.** The tunnel implementation carries IPv4 traffic only. IPv6 entries in the resource list (addresses, CIDR blocks, ranges) are ignored, and IPv6 destinations are always connected directly rather than through the tunnel. The aTrust wire format has IPv6 fields, so this is an implementation gap rather than a protocol limit; tunnelling IPv6 would need verification against a server that publishes IPv6 resources.
 
 ## Transport lifecycle and keepalive
 
@@ -73,7 +81,7 @@ Version tags create GitHub Releases containing platform-specific archives. Consu
 
 ## Related projects
 
-- [NulConnect](https://github.com/jsjtsty/NulConnect) — macOS client
+- [NulConnect](https://github.com/jsjtsty/NulConnect) — macOS aTrust client built on this library
 - [nulconnect-helper](https://github.com/jsjtsty/nulconnect-helper) — privileged platform helper
 
 ## License

@@ -662,7 +662,12 @@ fn resolved_tcp_route(client: &AtrClient, host: &str, port: u16) -> AtrResult<Re
             connect_host: host.to_string(),
         });
     }
-    if host.parse::<std::net::Ipv4Addr>().is_ok() {
+    // IP literals (including IPv6, which the tunnel cannot carry) are never re-resolved.
+    if host
+        .trim_matches(['[', ']'])
+        .parse::<std::net::IpAddr>()
+        .is_ok()
+    {
         return Ok(ResolvedProxyRoute {
             decision: ProxyRouteDecision::Direct,
             connect_host: host.to_string(),
