@@ -1,6 +1,7 @@
 mod auth;
 mod client;
 mod error;
+mod log;
 mod pac;
 mod proxy_service;
 mod resource;
@@ -8,42 +9,12 @@ mod sign;
 mod transport;
 mod types;
 
-#[cfg(feature = "verbose-logs")]
-pub(crate) fn diag_log(message: impl AsRef<str>) {
-    let message = message.as_ref();
-    eprintln!("{message}");
-
-    let log_path = std::env::var_os("HOME")
-        .filter(|home| home != "/var/root")
-        .map(|home| {
-            std::path::PathBuf::from(home)
-                .join("Library/Application Support/NulConnect/NulConnect.log")
-        })
-        .unwrap_or_else(|| {
-            std::path::PathBuf::from(
-                "/Library/Application Support/NulConnect/nulconnect-helper.log",
-            )
-        });
-
-    if let Some(parent) = log_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_path)
-    {
-        use std::io::Write as _;
-        let _ = writeln!(file, "{message}");
-    }
-}
-
-#[cfg(not(feature = "verbose-logs"))]
-pub(crate) fn diag_log(_message: impl AsRef<str>) {}
-
 pub use auth::AuthSession;
 pub use client::AtrClient;
 pub use error::{AtrError, AtrResult, ErrorCode};
+pub use log::{
+    MAX_LOG_BYTES, log_file_path, log_write, set_verbose_logging, verbose_logging_enabled,
+};
 pub use pac::generate_pac;
 pub use proxy_service::{
     ProxyService, ProxyServiceConfig, ProxyServiceEvent, ProxyServiceEventListener,

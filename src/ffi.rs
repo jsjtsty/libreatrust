@@ -1279,6 +1279,29 @@ pub extern "C" fn atr_auth_session_free(session: *mut atr_auth_session_t) {
     }
 }
 
+/// Turns diagnostic logging on or off for the whole process. Off by default.
+#[unsafe(no_mangle)]
+pub extern "C" fn atr_set_verbose_logging(enabled: bool) {
+    libreatrust_core::set_verbose_logging(enabled);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn atr_verbose_logging_enabled() -> bool {
+    libreatrust_core::verbose_logging_enabled()
+}
+
+/// Appends a line to the shared diagnostic log when logging is enabled, so a
+/// host application can write to the same rotated file. `message` must be a
+/// NUL-terminated UTF-8 string.
+#[unsafe(no_mangle)]
+pub extern "C" fn atr_log_write(message: *const c_char) {
+    if message.is_null() || !libreatrust_core::verbose_logging_enabled() {
+        return;
+    }
+    let message = unsafe { CStr::from_ptr(message) };
+    libreatrust_core::log_write(&message.to_string_lossy());
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn atr_string_free(ptr: *mut c_char) {
     free_c_string(ptr);

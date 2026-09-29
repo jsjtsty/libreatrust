@@ -77,10 +77,11 @@ impl TcpTunnel {
         let node_addr = client.best_node_for(&hit.node_group_id).ok_or_else(|| {
             AtrError::NotFound(format!("no node for group {}", hit.node_group_id))
         })?;
-        crate::diag_log(format!(
+        crate::log::diag_log!(
             "[libreatrust][tcp] connect begin target={host}:{port} app={} node_group={} node={node_addr}",
-            hit.app_id, hit.node_group_id
-        ));
+            hit.app_id,
+            hit.node_group_id
+        );
         let session = client
             .session()
             .ok_or_else(|| AtrError::InvalidState("session not set".into()))?;
@@ -92,9 +93,7 @@ impl TcpTunnel {
         send_tcp_dest(&mut stream, host, port)?;
         wait_for_tcp_connect_status(&mut stream)?;
         stream.sock.set_read_timeout(None)?;
-        crate::diag_log(format!(
-            "[libreatrust][tcp] connect ready target={host}:{port}"
-        ));
+        crate::log::diag_log!("[libreatrust][tcp] connect ready target={host}:{port}");
 
         let (incoming_tx, incoming_rx) = mpsc::channel();
         let (write_tx, write_rx) = mpsc::channel();
@@ -513,9 +512,9 @@ pub(crate) fn connect_tcp_any(
         match connect_tcp_bound(addr, attempt_timeout, config) {
             Ok(stream) => return Ok(stream),
             Err(err) => {
-                crate::diag_log(format!(
+                crate::log::diag_log!(
                     "[libreatrust][transport] connect candidate {addr} failed: {err}"
-                ));
+                );
                 last_error = Some(err);
             }
         }
@@ -548,10 +547,11 @@ pub(crate) fn connect_tcp_bound(
     if refreshed_index == selected_index {
         return result;
     }
-    crate::diag_log(format!(
+    crate::log::diag_log!(
         "[libreatrust][transport] retrying outbound connection after interface refresh: {:?} -> {:?}",
-        selected_index, refreshed_index
-    ));
+        selected_index,
+        refreshed_index
+    );
     connect_tcp_bound_once(addr, timeout, refreshed_index).and_then(configure_connected_tcp)
 }
 
@@ -597,9 +597,7 @@ fn configure_connected_tcp(stream: TcpStream) -> AtrResult<TcpStream> {
     if let Err(err) = socket.set_tcp_keepalive(&keepalive) {
         // TCP keepalive tuning is not uniformly supported. Keep the connection
         // usable when the platform only supports a subset of these options.
-        crate::diag_log(format!(
-            "[libreatrust][transport] failed to configure TCP keepalive: {err}"
-        ));
+        crate::log::diag_log!("[libreatrust][transport] failed to configure TCP keepalive: {err}");
         let _ = socket.set_keepalive(true);
     }
     Ok(stream)
@@ -720,9 +718,9 @@ fn set_windows_bound_interface(
     if result != 0 {
         return Err(AtrError::from(std::io::Error::last_os_error()));
     }
-    crate::diag_log(format!(
+    crate::log::diag_log!(
         "[libreatrust][transport] bound Windows socket to if_index={interface_index}"
-    ));
+    );
     Ok(())
 }
 
@@ -741,7 +739,7 @@ fn set_bound_interface(
     interface_index: Option<u32>,
 ) -> AtrResult<()> {
     let Some(interface_index) = interface_index else {
-        crate::diag_log(
+        crate::log::diag_log!(
             "[libreatrust][transport] no physical interface available for bound socket",
         );
         return Ok(());
@@ -763,9 +761,9 @@ fn set_bound_interface(
     if result != 0 {
         return Err(AtrError::from(std::io::Error::last_os_error()));
     }
-    crate::diag_log(format!(
+    crate::log::diag_log!(
         "[libreatrust][transport] bound outbound socket to if_index={interface_index}"
-    ));
+    );
     Ok(())
 }
 
@@ -1046,9 +1044,9 @@ fn active_physical_interface(addr: &SocketAddr) -> Option<u32> {
     }
 
     best.map(|(_, index, name)| {
-        crate::diag_log(format!(
+        crate::log::diag_log!(
             "[libreatrust][transport] selected active physical interface {name} if_index={index}"
-        ));
+        );
         index
     })
 }
@@ -1298,10 +1296,10 @@ fn wait_for_tcp_connect_status<S: Read + Write>(stream: &mut S) -> AtrResult<()>
                 let mut marker = [0u8; 2];
                 read_tunnel_exact_blocking(stream, &mut marker)?;
                 if marker != [0x53, 0x00] {
-                    crate::diag_log(format!(
+                    crate::log::diag_log!(
                         "[libreatrust][tcp] ignoring tunnel auth marker {:02x?}",
                         marker
-                    ));
+                    );
                     continue;
                 }
 
@@ -1311,7 +1309,7 @@ fn wait_for_tcp_connect_status<S: Read + Write>(stream: &mut S) -> AtrResult<()>
                 let mut payload = vec![0u8; len];
                 read_tunnel_exact_blocking(stream, &mut payload)?;
                 let text = String::from_utf8_lossy(&payload);
-                crate::diag_log(format!("[libreatrust][tcp] tunnel auth response {}", text));
+                crate::log::diag_log!("[libreatrust][tcp] tunnel auth response {}", text);
                 if text.contains("OK")
                     || text.contains("Succeeded")
                     || text.contains(r#""message":"OK""#)
@@ -1422,10 +1420,10 @@ fn read_tcp_frame<R: Read>(stream: &mut R) -> AtrResult<Option<TcpFrameRead>> {
             let mut marker = [0u8; 2];
             read_tunnel_exact_blocking(stream, &mut marker)?;
             if marker != [0x53, 0x00] {
-                crate::diag_log(format!(
+                crate::log::diag_log!(
                     "[libreatrust][tcp] ignoring tunnel auth marker {:02x?}",
                     marker
-                ));
+                );
                 return Ok(Some(TcpFrameRead::Control));
             }
 
@@ -1435,7 +1433,7 @@ fn read_tcp_frame<R: Read>(stream: &mut R) -> AtrResult<Option<TcpFrameRead>> {
             let mut payload = vec![0u8; len];
             read_tunnel_exact_blocking(stream, &mut payload)?;
             let text = String::from_utf8_lossy(&payload);
-            crate::diag_log(format!("[libreatrust][tcp] tunnel auth response {}", text));
+            crate::log::diag_log!("[libreatrust][tcp] tunnel auth response {}", text);
             if !text.contains(r#""message":"OK""#) && !text.contains(r#""message":"Succeeded""#) {
                 return Err(AtrError::NetworkFailed(text.into_owned()));
             }
@@ -1444,20 +1442,22 @@ fn read_tcp_frame<R: Read>(stream: &mut R) -> AtrResult<Option<TcpFrameRead>> {
         [0x05, status] => {
             let mut tail = [0u8; 8];
             read_tunnel_exact_blocking(stream, &mut tail)?;
-            crate::diag_log(format!(
+            crate::log::diag_log!(
                 "[libreatrust][tcp] ignoring tunnel control status={:02x} tail={:02x?}",
-                status, tail
-            ));
+                status,
+                tail
+            );
             Ok(Some(TcpFrameRead::Control))
         }
         _ => {
             // The aTrust data stream may contain undocumented two-byte
             // extension/control headers. Match the upstream behavior by
             // consuming them and continuing to drain already-buffered frames.
-            crate::diag_log(format!(
+            crate::log::diag_log!(
                 "[libreatrust][tcp] ignoring tunnel extension header {:02x} {:02x}",
-                header[0], header[1]
-            ));
+                header[0],
+                header[1]
+            );
             Ok(Some(TcpFrameRead::Control))
         }
     }
@@ -1704,7 +1704,7 @@ impl L3Tunnel {
         if self.state.close_flag.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
-        crate::diag_log("[libreatrust][l3] tunnel close requested");
+        crate::log::diag_log!("[libreatrust][l3] tunnel close requested");
         if let Some(worker) = self.business_keepalive_worker.lock().unwrap().take() {
             let _ = worker.join();
         }
@@ -1719,7 +1719,7 @@ impl L3Tunnel {
         for remote in remotes {
             remote.close();
         }
-        crate::diag_log("[libreatrust][l3] tunnel close completed");
+        crate::log::diag_log!("[libreatrust][l3] tunnel close completed");
         Ok(())
     }
 
@@ -1741,9 +1741,9 @@ impl L3TunnelState {
             if !existing.close_flag.load(Ordering::SeqCst) {
                 return Ok(existing);
             }
-            crate::diag_log(format!(
+            crate::log::diag_log!(
                 "[libreatrust][l3] replacing closed remote node_group={node_group_id}"
-            ));
+            );
             self.remotes.lock().unwrap().remove(node_group_id);
             existing.close();
         }
@@ -1751,9 +1751,9 @@ impl L3TunnelState {
             .client
             .best_node_for(node_group_id)
             .ok_or_else(|| AtrError::NotFound(format!("no node for group {node_group_id}")))?;
-        crate::diag_log(format!(
+        crate::log::diag_log!(
             "[libreatrust][l3] remote connect begin node_group={node_group_id} node={node_addr}"
-        ));
+        );
         let session = self
             .client
             .session()
@@ -1770,9 +1770,7 @@ impl L3TunnelState {
             .lock()
             .unwrap()
             .insert(node_group_id.to_string(), remote.clone());
-        crate::diag_log(format!(
-            "[libreatrust][l3] remote connect ready node_group={node_group_id}"
-        ));
+        crate::log::diag_log!("[libreatrust][l3] remote connect ready node_group={node_group_id}");
         Ok(remote)
     }
 }
@@ -1783,7 +1781,7 @@ fn business_keepalive_loop(state: Arc<L3TunnelState>) {
         .resource()
         .map(|resource| resource.major_node_group.clone())
     else {
-        crate::diag_log("[libreatrust][l3] business keepalive disabled: resource not set");
+        crate::log::diag_log!("[libreatrust][l3] business keepalive disabled: resource not set");
         return;
     };
 
@@ -1794,10 +1792,10 @@ fn business_keepalive_loop(state: Arc<L3TunnelState>) {
         .remote_for(&node_group_id)
         .and_then(|remote| remote.send_heartbeat())
     {
-        crate::diag_log(format!(
+        crate::log::diag_log!(
             "[libreatrust][l3] business keepalive could not establish L3 session error={error}; retrying in {}s",
             L3_BUSINESS_KEEPALIVE_RETRY_INTERVAL.as_secs()
-        ));
+        );
         sleep_until_keepalive(&state.close_flag, L3_BUSINESS_KEEPALIVE_RETRY_INTERVAL);
         if state.close_flag.load(Ordering::SeqCst) {
             return;
@@ -1805,31 +1803,31 @@ fn business_keepalive_loop(state: Arc<L3TunnelState>) {
     }
 
     let Some(target) = select_icmp_keepalive_target(&state.client) else {
-        crate::diag_log(
+        crate::log::diag_log!(
             "[libreatrust][l3] business keepalive disabled: no managed IPv4 ICMP target",
         );
         return;
     };
 
-    crate::diag_log(format!(
+    crate::log::diag_log!(
         "[libreatrust][l3] business keepalive started target={target} interval_secs={}",
         L3_BUSINESS_KEEPALIVE_INTERVAL.as_secs()
-    ));
+    );
 
     let mut sequence = 0u16;
     while !state.close_flag.load(Ordering::SeqCst) {
         match send_icmp_keepalive(&state, target, sequence) {
-            Ok(()) => crate::diag_log(format!(
+            Ok(()) => crate::log::diag_log!(
                 "[libreatrust][l3] business keepalive sent target={target} sequence={sequence}"
-            )),
-            Err(error) => crate::diag_log(format!(
+            ),
+            Err(error) => crate::log::diag_log!(
                 "[libreatrust][l3] business keepalive failed target={target} sequence={sequence} error={error}"
-            )),
+            ),
         }
         sequence = sequence.wrapping_add(1);
         sleep_until_keepalive(&state.close_flag, L3_BUSINESS_KEEPALIVE_INTERVAL);
     }
-    crate::diag_log("[libreatrust][l3] business keepalive stopped");
+    crate::log::diag_log!("[libreatrust][l3] business keepalive stopped");
 }
 
 fn send_icmp_keepalive(
@@ -1868,10 +1866,10 @@ fn send_icmp_keepalive(
         &hit.node_group_id,
         &packet,
     )?;
-    crate::diag_log(format!(
+    crate::log::diag_log!(
         "[libreatrust][l3] business keepalive packet source={source} target={destination} bytes={}",
         packet.len()
-    ));
+    );
     Ok(())
 }
 
@@ -2154,9 +2152,9 @@ impl L3Remote {
 
     fn close(&self) {
         let was_closed = self.close_flag.swap(true, Ordering::SeqCst);
-        crate::diag_log(format!(
+        crate::log::diag_log!(
             "[libreatrust][l3] remote close requested already_closed={was_closed}"
-        ));
+        );
         if !was_closed {
             let _ = self.command_tx.send(L3RemoteCommand::Close);
             self.wake_worker();
@@ -2164,9 +2162,9 @@ impl L3Remote {
         if let Some(worker) = self.worker.lock().unwrap().take()
             && worker.join().is_err()
         {
-            crate::diag_log("[libreatrust][l3] remote worker join failed");
+            crate::log::diag_log!("[libreatrust][l3] remote worker join failed");
         }
-        crate::diag_log("[libreatrust][l3] remote close completed");
+        crate::log::diag_log!("[libreatrust][l3] remote close completed");
     }
 
     fn write_packet(
@@ -2192,7 +2190,7 @@ impl L3Remote {
 
     fn send_heartbeat(&self) -> AtrResult<()> {
         self.enqueue_payload(vec![0x05, 0x15, 0x00, 0x00])?;
-        crate::diag_log("[libreatrust][l3] keep-alive heartbeat sent");
+        crate::log::diag_log!("[libreatrust][l3] keep-alive heartbeat sent");
         Ok(())
     }
 
@@ -2235,10 +2233,7 @@ impl L3Remote {
         let packet = build_l3_auth_request_payload(&req)?;
         // `ct.key` embeds the real destination IP:port the user is
         // visiting; log the opaque conntrack id instead.
-        crate::diag_log(format!(
-            "[libreatrust][l3] auth request conntrack={}",
-            ct.auth_id
-        ));
+        crate::log::diag_log!("[libreatrust][l3] auth request conntrack={}", ct.auth_id);
         self.enqueue_payload(packet)
     }
 
@@ -2267,15 +2262,13 @@ fn authenticate_l3_stream(
 ) -> AtrResult<()> {
     let req = serde_json::to_vec(&json!({ "sid": info.sid }))?;
     let packet = wrap_auth_req_data(&req, 1);
-    crate::diag_log("[libreatrust][l3] tunnel auth send sid");
+    crate::log::diag_log!("[libreatrust][l3] tunnel auth send sid");
     stream.write_all(&packet)?;
     stream.flush()?;
 
     let mut method = [0u8; 2];
     stream.read_exact(&mut method)?;
-    crate::diag_log(format!(
-        "[libreatrust][l3] tunnel auth method={method:02x?}"
-    ));
+    crate::log::diag_log!("[libreatrust][l3] tunnel auth method={method:02x?}");
     if method != [0x05, 0xD0] {
         return Err(AtrError::NetworkFailed(format!(
             "unexpected auth method {:?}",
@@ -2285,9 +2278,7 @@ fn authenticate_l3_stream(
 
     let mut header = [0u8; 4];
     stream.read_exact(&mut header)?;
-    crate::diag_log(format!(
-        "[libreatrust][l3] tunnel auth header={header:02x?}"
-    ));
+    crate::log::diag_log!("[libreatrust][l3] tunnel auth header={header:02x?}");
     if header[0] != 0x53 {
         return Err(AtrError::NetworkFailed(format!(
             "unexpected auth header {:02x?}",
@@ -2301,10 +2292,10 @@ fn authenticate_l3_stream(
         stream.read_exact(&mut payload)?;
     }
     if !payload.is_empty() {
-        crate::diag_log(format!(
+        crate::log::diag_log!(
             "[libreatrust][l3] tunnel auth payload {}",
             String::from_utf8_lossy(&payload)
-        ));
+        );
     }
     if status != 0 {
         return Err(AtrError::Unauthorized(
@@ -2323,26 +2314,26 @@ fn authenticate_l3_stream(
 
     let mut vip_header = [0u8; 4];
     if read_tunnel_exact(&mut *stream, &mut vip_header)? && vip_header[0] == 0x05 {
-        crate::diag_log(format!(
+        crate::log::diag_log!(
             "[libreatrust][l3] tunnel auth optional vip header={vip_header:02x?}"
-        ));
+        );
         let data_len = vip_payload_length(vip_header[3]);
         if data_len > 0 {
             let mut vip_data = vec![0u8; data_len];
             read_tunnel_exact_blocking(&mut *stream, &mut vip_data)?;
             if let Some(ips) = parse_virtual_ip_bytes(&vip_data) {
-                crate::diag_log(format!(
+                crate::log::diag_log!(
                     "[libreatrust][l3] tunnel auth vip={}",
                     ips.iter()
                         .map(ToString::to_string)
                         .collect::<Vec<_>>()
                         .join(",")
-                ));
+                );
                 *vip_list.lock().unwrap() = ips;
             }
         }
     }
-    crate::diag_log("[libreatrust][l3] tunnel auth ready");
+    crate::log::diag_log!("[libreatrust][l3] tunnel auth ready");
     Ok(())
 }
 
@@ -2355,11 +2346,11 @@ fn run_l3_remote_worker(
     close_flag: Arc<AtomicBool>,
     vip_list: Arc<Mutex<Vec<Ipv4Addr>>>,
 ) {
-    crate::diag_log(format!(
+    crate::log::diag_log!(
         "[libreatrust][l3] I/O worker started heartbeat_secs={} read_batch_frames={}",
         L3_PROTOCOL_HEARTBEAT_INTERVAL.as_secs(),
         L3_READ_BATCH_FRAMES
-    ));
+    );
     let mut stream = L3BufferedStream::new(stream);
     let result = run_l3_remote_worker_inner(
         &mut stream,
@@ -2373,15 +2364,13 @@ fn run_l3_remote_worker(
     let failure = match result {
         Ok(()) => AtrError::NetworkFailed("l3 remote closed".into()),
         Err(error) => {
-            crate::diag_log(format!(
-                "[libreatrust][l3] I/O worker stopped with error={error}"
-            ));
+            crate::log::diag_log!("[libreatrust][l3] I/O worker stopped with error={error}");
             error
         }
     };
     conntracks.fail_pending(failure);
     let _ = stream.socket().shutdown(Shutdown::Both);
-    crate::diag_log("[libreatrust][l3] I/O worker stopped");
+    crate::log::diag_log!("[libreatrust][l3] I/O worker stopped");
 }
 
 fn run_l3_remote_worker_inner(
@@ -2407,7 +2396,7 @@ fn run_l3_remote_worker_inner(
         if Instant::now() >= next_heartbeat {
             stream.write_all(&[0x05, 0x15, 0x00, 0x00])?;
             stream.flush()?;
-            crate::diag_log("[libreatrust][l3] I/O worker sent heartbeat");
+            crate::log::diag_log!("[libreatrust][l3] I/O worker sent heartbeat");
             next_heartbeat = Instant::now() + L3_PROTOCOL_HEARTBEAT_INTERVAL;
         }
 
@@ -2552,15 +2541,15 @@ fn handle_l3_remote_frame(
                     })?;
                 }
             }
-            Err(error) => crate::diag_log(format!(
-                "[libreatrust][l3] data payload decode failed error={error}"
-            )),
+            Err(error) => {
+                crate::log::diag_log!("[libreatrust][l3] data payload decode failed error={error}")
+            }
         },
         0x93 => {
             if let Err(error) = handle_auth_resp(conntracks, frame.status, &frame.payload) {
-                crate::diag_log(format!(
+                crate::log::diag_log!(
                     "[libreatrust][l3] auth response handling failed error={error}"
-                ));
+                );
             }
         }
         L3_HEARTBEAT_REPLY_CMD => {}
@@ -3386,7 +3375,7 @@ impl AtrClient {
         let addr = self
             .best_node()
             .ok_or_else(|| AtrError::NotFound("no node for l3 virtual ip request".into()))?;
-        crate::diag_log(format!("[libreatrust][l3] virtual ip request node={addr}"));
+        crate::log::diag_log!("[libreatrust][l3] virtual ip request node={addr}");
 
         let mut stream = connect_tls(&addr, self.client_config())?;
         stream.sock.set_read_timeout(Some(Duration::from_millis(
@@ -3455,13 +3444,13 @@ impl AtrClient {
         let ips = parse_virtual_ip_bytes(&vip_data)
             .filter(|ips| !ips.is_empty())
             .ok_or_else(|| AtrError::ParseFailed("virtual ip response had no ipv4".into()))?;
-        crate::diag_log(format!(
+        crate::log::diag_log!(
             "[libreatrust][l3] virtual ip ready {}",
             ips.iter()
                 .map(ToString::to_string)
                 .collect::<Vec<_>>()
                 .join(",")
-        ));
+        );
         Ok(ips)
     }
 }

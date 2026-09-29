@@ -653,7 +653,7 @@ impl AuthSession {
                 qp.append_pair(k, v);
             }
         }
-        crate::diag_log(format!("[libreatrust][auth] GET {}", url));
+        crate::log::diag_log!("[libreatrust][auth] GET {}", url);
         let resp = self
             .client
             .get(url)
@@ -663,10 +663,7 @@ impl AuthSession {
             .header("x-sdp-traceid", self.trace_id())
             .send()
             .map_err(|err| {
-                crate::diag_log(format!(
-                    "[libreatrust][auth] authConfig request failed: {}",
-                    err
-                ));
+                crate::log::diag_log!("[libreatrust][auth] authConfig request failed: {}", err);
                 err
             })?;
         let status = resp.status();
@@ -674,16 +671,13 @@ impl AuthSession {
         let body = resp.text()?;
         // The response body carries csrfToken and other auth-server session
         // material, so log only enough to diagnose transport issues.
-        crate::diag_log(format!(
+        crate::log::diag_log!(
             "[libreatrust][auth] authConfig response status={} body_len={}",
             status,
             body.len()
-        ));
+        );
         let parsed: AuthConfigResponse = serde_json::from_str(&body).map_err(|err| {
-            crate::diag_log(format!(
-                "[libreatrust][auth] authConfig parse failed: {}",
-                err
-            ));
+            crate::log::diag_log!("[libreatrust][auth] authConfig parse failed: {}", err);
             err
         })?;
         self.csrf_token = if parsed.data.csrf_token.is_empty() {
@@ -861,17 +855,15 @@ impl AuthSession {
                 .unwrap_or_default();
             if !numbers.is_empty() {
                 // Phone numbers are PII; log only that some were found.
-                crate::diag_log(format!(
+                crate::log::diag_log!(
                     "[libreatrust][auth] available phone numbers: count={}",
                     numbers.len()
-                ));
+                );
             }
             Ok(())
         })();
         if let Err(error) = result {
-            crate::diag_log(format!(
-                "[libreatrust][auth] phone number lookup skipped: {error}"
-            ));
+            crate::log::diag_log!("[libreatrust][auth] phone number lookup skipped: {error}");
         }
     }
 
@@ -987,10 +979,7 @@ impl AuthSession {
                 parsed.code, parsed.message
             )));
         }
-        crate::diag_log(format!(
-            "[libreatrust][auth] custom SMS: {}",
-            parsed.data.tips
-        ));
+        crate::log::diag_log!("[libreatrust][auth] custom SMS: {}", parsed.data.tips);
         Ok(())
     }
 

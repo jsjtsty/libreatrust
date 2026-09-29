@@ -20,6 +20,7 @@ The library provides:
 - TCP, UDP, and L3 tunnel primitives
 - Proxy service primitives with event (polled or callback) and traffic statistics
 - DNS and node-group resource access
+- A runtime-switchable diagnostic log (off by default; `atr_set_verbose_logging`, rotated at 5 MB)
 - C ABI bindings for Swift, Kotlin, C/C++, and other FFI consumers
 
 The library does not provide a login UI, WebView hosting, or platform-specific user-interface orchestration. Those responsibilities belong to the integrating application.

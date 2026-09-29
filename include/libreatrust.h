@@ -256,6 +256,18 @@ typedef struct atr_auth_challenge_t {
 const char *atr_last_error_message(void);
 
 void atr_string_free(char *ptr);
+
+/**
+ * Turns diagnostic logging on or off for the whole process (off by default).
+ * Lines are appended to a log file that is rotated to "<name>.1" at 5 MB:
+ * "~/Library/Application Support/NulConnect/NulConnect.log" for a user
+ * process, or "/Library/Application Support/NulConnect/nulconnect-helper.log"
+ * when running as root.
+ */
+void atr_set_verbose_logging(bool enabled);
+bool atr_verbose_logging_enabled(void);
+/** Appends a NUL-terminated UTF-8 line to the shared log when enabled. */
+void atr_log_write(const char *message);
 void atr_blob_free(atr_blob_t *blob);
 void atr_string_list_free(atr_string_list_t *list);
 void atr_auth_method_list_free(atr_auth_method_list_t *list);

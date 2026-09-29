@@ -128,13 +128,13 @@ impl ProxyService {
         let active_sockets = Arc::new(Mutex::new(HashMap::new()));
         let keepalive_l3 = match client.open_l3_tunnel() {
             Ok(tunnel) => {
-                crate::diag_log("[libreatrust][proxy] dedicated L3 keepalive tunnel started");
+                crate::log::diag_log!("[libreatrust][proxy] dedicated L3 keepalive tunnel started");
                 Some(tunnel)
             }
             Err(error) => {
-                crate::diag_log(format!(
+                crate::log::diag_log!(
                     "[libreatrust][proxy] dedicated L3 keepalive unavailable error={error}"
-                ));
+                );
                 None
             }
         };
@@ -202,7 +202,7 @@ impl ProxyService {
         }
         if let Some(tunnel) = self.keepalive_l3.lock().unwrap().take() {
             let _ = tunnel.close();
-            crate::diag_log("[libreatrust][proxy] dedicated L3 keepalive tunnel stopped");
+            crate::log::diag_log!("[libreatrust][proxy] dedicated L3 keepalive tunnel stopped");
         }
         Ok(())
     }
@@ -307,9 +307,7 @@ fn run_listener(
                         if let Err(err) =
                             handle_connection(stream, client, config, upload, download)
                         {
-                            crate::diag_log(format!(
-                                "[libreatrust][proxy] connection failed: {err}"
-                            ));
+                            crate::log::diag_log!("[libreatrust][proxy] connection failed: {err}");
                             record_proxy_error(&error_slot, &event_slot, &listener_slot, err);
                         }
                         socket_map.lock().unwrap().remove(&connection_id);
@@ -440,12 +438,12 @@ fn handle_socks5(
         }
     };
 
-    crate::diag_log(format!(
+    crate::log::diag_log!(
         "[libreatrust][proxy] socks5 connect target={}:{} leftover={}B",
         request.host,
         request.port,
         request.leftover.len()
-    ));
+    );
     match open_proxy_target(&client, &request.host, request.port, &config) {
         Ok(remote) => {
             client_stream.write_all(&socks5_reply(0x00))?;
@@ -492,9 +490,7 @@ fn handle_http(
 
     if request.method.eq_ignore_ascii_case("CONNECT") {
         let (host, port) = parse_host_port(&request.target, 443)?;
-        crate::diag_log(format!(
-            "[libreatrust][proxy] http CONNECT target={host}:{port}"
-        ));
+        crate::log::diag_log!("[libreatrust][proxy] http CONNECT target={host}:{port}");
         match open_proxy_target(&client, &host, port, &config) {
             Ok(remote) => {
                 client_stream.write_all(
@@ -527,10 +523,10 @@ fn handle_http(
         serve_local_http_request(client_stream, &request, &client, &config)
     } else {
         let (host, port, rewritten) = rewrite_http_proxy_request(request)?;
-        crate::diag_log(format!(
+        crate::log::diag_log!(
             "[libreatrust][proxy] http request target={host}:{port} rewritten={}B",
             rewritten.len()
-        ));
+        );
         let remote = match open_proxy_target(&client, &host, port, &config) {
             Ok(remote) => remote,
             Err(err) => {
@@ -617,20 +613,21 @@ fn open_proxy_target(
     let route = resolved_tcp_route(client, host, port)?;
     match route.decision {
         ProxyRouteDecision::Managed => {
-            crate::diag_log(format!(
+            crate::log::diag_log!(
                 "[libreatrust][proxy] route managed requested={host}:{port} connect={}:{}",
-                route.connect_host, port
-            ));
+                route.connect_host,
+                port
+            );
             Ok(ProxyRemote::Managed(
                 client.open_tcp_tunnel(&route.connect_host, port)?,
             ))
         }
         ProxyRouteDecision::Direct => {
             let addrs: Vec<SocketAddr> = (host, port).to_socket_addrs()?.collect();
-            crate::diag_log(format!(
+            crate::log::diag_log!(
                 "[libreatrust][proxy] route direct requested={host}:{port} candidates={}",
                 addrs.len()
-            ));
+            );
             let stream = connect_tcp_any(
                 &addrs,
                 Duration::from_millis(config.connect_timeout_ms.max(1)),
@@ -656,7 +653,7 @@ enum ProxyRouteDecision {
 
 fn resolved_tcp_route(client: &AtrClient, host: &str, port: u16) -> AtrResult<ResolvedProxyRoute> {
     if matches!(client.route_tcp(host, port), RouteDecision::Managed(_)) {
-        crate::diag_log(format!("[libreatrust][proxy] route hit host={host}:{port}"));
+        crate::log::diag_log!("[libreatrust][proxy] route hit host={host}:{port}");
         return Ok(ResolvedProxyRoute {
             decision: ProxyRouteDecision::Managed,
             connect_host: host.to_string(),
@@ -676,9 +673,9 @@ fn resolved_tcp_route(client: &AtrClient, host: &str, port: u16) -> AtrResult<Re
 
     for ip in resolve_ipv4_addresses(host) {
         if matches!(client.route_tcp(&ip, port), RouteDecision::Managed(_)) {
-            crate::diag_log(format!(
+            crate::log::diag_log!(
                 "[libreatrust][proxy] route hit resolved host={host}:{port} ip={ip}"
-            ));
+            );
             return Ok(ResolvedProxyRoute {
                 decision: ProxyRouteDecision::Managed,
                 connect_host: ip,
@@ -766,9 +763,9 @@ fn relay(
             let upstream = thread::spawn(move || {
                 let result = copy_tcp_to_tcp(&mut client_reader, &mut remote_writer);
                 if let Err(err) = &result {
-                    crate::diag_log(format!(
+                    crate::log::diag_log!(
                         "[libreatrust][proxy] relay direct client->remote failed: {err}"
-                    ));
+                    );
                 }
                 // Wake the peer-reading relay as well. Shutting down only the
                 // write half can leave ProxyService::stop waiting forever on
@@ -780,9 +777,9 @@ fn relay(
             let downstream = thread::spawn(move || {
                 let result = copy_tcp_to_tcp(&mut remote_reader, &mut client_writer);
                 if let Err(err) = &result {
-                    crate::diag_log(format!(
+                    crate::log::diag_log!(
                         "[libreatrust][proxy] relay direct remote->client failed: {err}"
-                    ));
+                    );
                 }
                 let _ = client_writer.shutdown(Shutdown::Write);
                 let _ = remote_reader.shutdown(Shutdown::Read);
@@ -807,9 +804,9 @@ fn relay(
                     managed_upload_bytes.as_ref(),
                 );
                 if let Err(err) = &result {
-                    crate::diag_log(format!(
+                    crate::log::diag_log!(
                         "[libreatrust][proxy] relay managed client->tunnel failed: {err}"
-                    ));
+                    );
                 }
                 let _ = tunnel_writer.close();
                 result
@@ -821,9 +818,9 @@ fn relay(
                     managed_download_bytes.as_ref(),
                 );
                 if let Err(err) = &result {
-                    crate::diag_log(format!(
+                    crate::log::diag_log!(
                         "[libreatrust][proxy] relay managed tunnel->client failed: {err}"
-                    ));
+                    );
                 }
                 let _ = client_writer.shutdown(Shutdown::Both);
                 let _ = tunnel_shutdown.close();
@@ -887,11 +884,11 @@ fn copy_tcp_to_tunnel(
         let write_start = Instant::now();
         let written = tunnel.write(&buf[..n])?;
         if n <= INTERACTIVE_CHUNK_BYTES {
-            crate::diag_log(format!(
+            crate::log::diag_log!(
                 "[libreatrust][proxy][relay] client->tunnel bytes={n} wait_for_read_ms={} tunnel_write_ms={}",
                 write_start.duration_since(read_start).as_millis(),
                 write_start.elapsed().as_millis()
-            ));
+            );
         }
         byte_counter.fetch_add(written as u64, Ordering::Relaxed);
     }
@@ -915,11 +912,11 @@ fn copy_tunnel_to_tcp(
         let write_start = Instant::now();
         writer.write_all(&buf[..n])?;
         if n <= INTERACTIVE_CHUNK_BYTES {
-            crate::diag_log(format!(
+            crate::log::diag_log!(
                 "[libreatrust][proxy][relay] tunnel->client bytes={n} wait_for_read_ms={} client_write_ms={}",
                 write_start.duration_since(read_start).as_millis(),
                 write_start.elapsed().as_millis()
-            ));
+            );
         }
         byte_counter.fetch_add(n as u64, Ordering::Relaxed);
     }
@@ -935,10 +932,10 @@ fn log_relay_gap(direction: &str, bytes: usize, last_chunk_at: &mut Option<Insta
     if let Some(previous) = last_chunk_at.replace(now) {
         let gap = now.duration_since(previous);
         if gap >= RELAY_STALL_LOG_THRESHOLD {
-            crate::diag_log(format!(
+            crate::log::diag_log!(
                 "[libreatrust][proxy][relay] {direction} gap_ms={} before bytes={bytes}",
                 gap.as_millis()
-            ));
+            );
         }
     }
 }

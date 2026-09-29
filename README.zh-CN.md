@@ -20,6 +20,7 @@
 - TCP、UDP 和 L3 隧道
 - 代理服务，带事件通知（轮询或回调）和流量统计
 - DNS 与节点组资源访问
+- 运行时可开关的诊断日志（默认关闭，`atr_set_verbose_logging`，5 MB 轮转）
 - 面向 Swift、Kotlin、C/C++ 等 FFI 调用方的 C ABI
 
 本库不提供登录界面、WebView 承载或平台相关的界面编排，这些由集成它的应用负责。
