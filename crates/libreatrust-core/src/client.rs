@@ -1,8 +1,9 @@
 use crate::error::{AtrError, AtrResult};
-use crate::resource::{ResourceSnapshot, route};
+use crate::resource::{ResourceSnapshot, domain_managed, ip_managed_for_tcp, route};
 use crate::sign::calc_request_sig;
 use crate::types::{ClientConfig, CookieRecord, ProtocolKind, RouteDecision, SessionMaterial};
 use std::collections::HashMap;
+use std::net::Ipv4Addr;
 
 #[derive(Debug, Clone)]
 pub struct AtrClient {
@@ -66,6 +67,31 @@ impl AtrClient {
 
     pub fn route_icmp(&self, host: &str) -> RouteDecision {
         self.route(host, 0, ProtocolKind::Icmp)
+    }
+
+    /// True when `host` is a managed domain for `protocol`, ignoring ports.
+    pub fn is_managed_domain(&self, host: &str, protocol: ProtocolKind) -> bool {
+        self.resource
+            .as_ref()
+            .is_some_and(|resource| domain_managed(resource, host, protocol))
+    }
+
+    /// True when `ip` lies in a managed IP range that carries TCP.
+    pub fn is_managed_ip_for_tcp(&self, ip: Ipv4Addr) -> bool {
+        self.resource
+            .as_ref()
+            .is_some_and(|resource| ip_managed_for_tcp(resource, ip))
+    }
+
+    /// The server-provided static address for `host`, if any.
+    pub fn static_dns_ip(&self, host: &str) -> Option<Ipv4Addr> {
+        let host = host.trim_end_matches('.').to_ascii_lowercase();
+        self.resource
+            .as_ref()?
+            .dns_resource
+            .iter()
+            .find(|(name, _)| name.trim_end_matches('.').eq_ignore_ascii_case(&host))
+            .map(|(_, ip)| *ip)
     }
 
     fn route(&self, host: &str, port: u16, protocol: ProtocolKind) -> RouteDecision {

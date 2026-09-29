@@ -296,10 +296,24 @@ fn match_domain(
     port: u16,
     protocol: ProtocolKind,
 ) -> Option<RouteHit> {
+    match_domain_ports(snapshot, host, Some(port), protocol)
+}
+
+/// Matches a domain against the managed-domain resources. With `port: None`
+/// the port range is ignored, which is what a DNS server needs: it learns the
+/// name long before it learns which port the application will connect to.
+fn match_domain_ports(
+    snapshot: &ResourceSnapshot,
+    host: &str,
+    port: Option<u16>,
+    protocol: ProtocolKind,
+) -> Option<RouteHit> {
     let host = host.trim_end_matches('.').to_ascii_lowercase();
     for (domain, resource) in &snapshot.domain_resources {
         if !protocol_matches(&resource.protocol, protocol)
-            || !ports_match(resource.port_min, resource.port_max, port, protocol)
+            || !port.is_none_or(|port| {
+                ports_match(resource.port_min, resource.port_max, port, protocol)
+            })
         {
             continue;
         }
@@ -322,6 +336,24 @@ fn match_domain(
         }
     }
     None
+}
+
+/// True when `host` is covered by a managed-domain resource for `protocol`,
+/// whatever the port.
+pub(crate) fn domain_managed(
+    snapshot: &ResourceSnapshot,
+    host: &str,
+    protocol: ProtocolKind,
+) -> bool {
+    match_domain_ports(snapshot, host, None, protocol).is_some()
+}
+
+/// True when `ip` falls inside any managed IP range that carries TCP.
+pub(crate) fn ip_managed_for_tcp(snapshot: &ResourceSnapshot, ip: Ipv4Addr) -> bool {
+    snapshot.ip_resources.iter().any(|resource| {
+        ip_between(ip, resource.ip_min, resource.ip_max)
+            && protocol_matches(&resource.protocol, ProtocolKind::Tcp)
+    })
 }
 
 fn match_ip(
@@ -510,6 +542,56 @@ fn ip_order(ip: Ipv4Addr) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn domain_managed_ignores_ports_but_respects_protocol() {
+        let mut snapshot = ResourceSnapshot::default();
+        snapshot.domain_resources.insert(
+            "example.com".into(),
+            DomainResource {
+                port_min: 443,
+                port_max: 443,
+                protocol: "tcp".into(),
+                app_id: "app".into(),
+                node_group_id: "group".into(),
+            },
+        );
+        assert!(domain_managed(
+            &snapshot,
+            "www.example.com",
+            ProtocolKind::Tcp
+        ));
+        assert!(domain_managed(&snapshot, "example.com.", ProtocolKind::Tcp));
+        assert!(!domain_managed(
+            &snapshot,
+            "www.example.com",
+            ProtocolKind::Udp
+        ));
+        assert!(!domain_managed(&snapshot, "example.org", ProtocolKind::Tcp));
+        // Routing a concrete connection still honours the port range.
+        assert!(matches!(
+            route(&snapshot, "www.example.com", 80, ProtocolKind::Tcp),
+            RouteDecision::Direct
+        ));
+    }
+
+    #[test]
+    fn ip_managed_for_tcp_checks_range_and_protocol() {
+        let mut snapshot = ResourceSnapshot::default();
+        snapshot.ip_resources.push(IpResource {
+            ip_min: "10.0.0.1".parse().unwrap(),
+            ip_max: "10.0.0.10".parse().unwrap(),
+            port_min: 0,
+            port_max: 65535,
+            protocol: "udp".into(),
+            app_id: "app".into(),
+            node_group_id: "group".into(),
+        });
+        assert!(!ip_managed_for_tcp(&snapshot, "10.0.0.5".parse().unwrap()));
+        snapshot.ip_resources[0].protocol = "all".into();
+        assert!(ip_managed_for_tcp(&snapshot, "10.0.0.5".parse().unwrap()));
+        assert!(!ip_managed_for_tcp(&snapshot, "10.0.0.11".parse().unwrap()));
+    }
 
     #[test]
     fn ipv6_entries_are_skipped_not_treated_as_domains() {
